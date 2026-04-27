@@ -20,6 +20,7 @@ from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 
 from ct.bridge.bot import BridgeBot
+from ct.bridge.runner_client import RunnerPool
 from ct.config import load_settings
 from ct.store.db import Db
 
@@ -59,7 +60,34 @@ async def _run() -> int:
     )
     db = Db(settings.db_path)
     await db.open()
-    bridge = BridgeBot(bot=bot, settings=settings, db=db)
+
+    # Connect to the local runner. On Mac Studio it's the in-machine LaunchAgent
+    # bound to 127.0.0.1; on other deployments it's whatever CT_RUNNER_HOST/PORT
+    # point at. Phase 3 adds /macs commands to register additional remote runners.
+    secret = (
+        settings.bridge_hmac_secret.encode("utf-8")
+        if settings.bridge_hmac_secret
+        else None
+    )
+    runners = RunnerPool(secret=secret)
+    try:
+        await runners.add_runner(
+            name="studio",
+            host=settings.runner_host,
+            port=settings.runner_port,
+        )
+    except Exception as exc:
+        await db.close()
+        await bot.session.close()
+        raise RuntimeError(
+            f"couldn't reach runner at {settings.runner_host}:{settings.runner_port} — "
+            f"is the runner LaunchAgent loaded? ({exc!r})"
+        ) from exc
+
+    bridge = BridgeBot(
+        bot=bot, settings=settings, db=db, runner_pool=runners,
+        default_runner="studio",
+    )
 
     me = await bot.get_me()
     log.info(
@@ -69,6 +97,7 @@ async def _run() -> int:
         chat_id=settings.telegram_chat_id,
         allowed_users=len(settings.telegram_allowed_user_ids),
         db_path=str(settings.db_path),
+        runner=f"{settings.runner_host}:{settings.runner_port}",
     )
 
     # Rehydrate active sessions from the DB before polling, so messages that

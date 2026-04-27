@@ -1,8 +1,9 @@
 """Aiogram bot wiring: middleware (allowlist + chat-id), commands, message
 routing, and inline-button callbacks.
 
-Phase 0 MVP. Everything is in one class for now; Phase 1 will likely extract
-commands into their own modules.
+Phase 2 onwards: every Claude session lives on a runner daemon (local or
+remote), reached over WebSocket via RunnerPool / SessionHandle. The bridge
+itself never imports the SDK directly.
 """
 
 from __future__ import annotations
@@ -17,27 +18,22 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message, TelegramObject
-from claude_agent_sdk import (
-    AssistantMessage,
-    ResultMessage,
-    SystemMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-    UserMessage,
-)
 
 from ct.bridge.permissions_ui import PermissionsUI
+from ct.bridge.runner_client import RunnerPool, SessionHandle
 from ct.bridge.sessions import RestoreSpec, SessionStore, TopicSession
 from ct.bridge.streaming import TopicRenderer
 from ct.bridge.topics import GENERAL_TOPIC_ID, create_topic
 from ct.config import Settings
-from ct.sdk_adapter.adapter import (
-    PermissionMode,
-    PermissionRequest,
-    SessionRunner,
+from ct.protocol.envelopes import (
+    Envelope,
+    T_SYSTEM,
+    T_TEXT,
+    T_THINKING,
+    T_TOOL_RESULT,
+    T_TOOL_USE,
 )
+from ct.sdk_adapter.adapter import PermissionMode, PermissionRequest
 from ct.store.db import Db
 
 log = structlog.get_logger(__name__)
@@ -47,33 +43,55 @@ VALID_MODES: tuple[PermissionMode, ...] = (
 )
 
 
-def _parse_new_args(text: str) -> tuple[str, str | None]:
-    """Parse `/new <name> [dir=<path>]`. Returns (name, dir-or-None)."""
+def _parse_new_args(text: str) -> tuple[str, str | None, str | None]:
+    """Parse `/new <name> [dir=<path>] [mac=<runner-name>]`.
+    Returns (name, dir-or-None, mac-or-None)."""
     parts = text.strip().split(maxsplit=1)
     if len(parts) < 2:
-        raise ValueError("usage: /new <name> [dir=<path>]")
+        raise ValueError("usage: /new <name> [dir=<path>] [mac=<runner>]")
     rest = parts[1].strip()
     name = rest
     cwd: str | None = None
+    mac: str | None = None
     if " dir=" in rest:
         idx = rest.index(" dir=")
         name = rest[:idx].strip()
-        cwd = rest[idx + len(" dir="):].strip()
-    elif rest.startswith("dir="):
-        # `/new dir=...` without a name — bail.
-        raise ValueError("usage: /new <name> [dir=<path>]")
+        rest = rest[idx + 1:]  # keep the rest including 'dir=...'
+    if " mac=" in rest:
+        idx = rest.index(" mac=")
+        if cwd is None:
+            # `mac=` came before any `dir=` parsing
+            name = rest[:idx].strip() if name == rest else name
+        rest_after_mac = rest[idx + len(" mac="):].strip()
+        # Take up to next space
+        mac = rest_after_mac.split()[0] if rest_after_mac else None
+        rest = rest[:idx]
+    if rest.startswith("dir="):
+        cwd = rest[len("dir="):].strip()
+    elif "dir=" in rest:
+        cwd = rest[rest.index("dir=") + len("dir="):].strip()
     if not name:
         raise ValueError("project name can't be empty")
-    return name, cwd
+    return name, cwd, mac
 
 
 class BridgeBot:
     """One bot instance, one supergroup, many forum-topic sessions."""
 
-    def __init__(self, bot: Bot, settings: Settings, db: Db) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        settings: Settings,
+        db: Db,
+        runner_pool: RunnerPool,
+        *,
+        default_runner: str = "studio",
+    ) -> None:
         self.bot = bot
         self.settings = settings
         self.db = db
+        self.runners = runner_pool
+        self.default_runner = default_runner
         self.sessions = SessionStore(db)
         self.permissions_ui = PermissionsUI(bot)
         self.dp = Dispatcher()
@@ -89,7 +107,6 @@ class BridgeBot:
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        """Drop any update that's not from our chat or our allowlist."""
         chat_id = None
         user_id = None
         if isinstance(event, Message):
@@ -117,9 +134,9 @@ class BridgeBot:
         self._router.message.register(self.cmd_list, Command("list"))
         self._router.message.register(self.cmd_permissions, Command("permissions"))
         self._router.message.register(self.cmd_close, Command("close"))
+        self._router.message.register(self.cmd_macs, Command("macs"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
 
-        # Free-text in any non-General topic with text → run a turn.
         self._router.message.register(
             self.on_topic_message,
             F.message_thread_id.is_not(None) & F.text.is_not(None) & ~F.text.startswith("/"),
@@ -133,26 +150,46 @@ class BridgeBot:
         await message.answer(
             "Claude → Telegram bridge\n\n"
             "Commands:\n"
-            "  /new <name> [dir=<path>] — create a new session in its own topic\n"
+            "  /new <name> [dir=<path>] [mac=<runner>] — start a session in its own topic\n"
             "  /list — show active sessions\n"
             "  /permissions [mode] — show or change permission mode for this topic\n"
             "  /close — close this topic's session\n"
+            "  /macs — list registered runners\n"
             "  /help — this message\n\n"
             "Just type in a topic to talk to that session's Claude.\n"
             "Permission modes: " + ", ".join(VALID_MODES)
         )
 
+    async def cmd_macs(self, message: Message) -> None:
+        names = self.runners.names()
+        if not names:
+            await message.answer("no runners registered.")
+            return
+        lines = ["registered runners:"]
+        for n in names:
+            conn = self.runners.get(n)
+            lines.append(f"  • {n}  ({conn.host}:{conn.port})")
+        await message.answer("\n".join(lines))
+
     async def cmd_new(self, message: Message) -> None:
         if message.text is None:
             return
         try:
-            name, dir_arg = _parse_new_args(message.text)
+            name, dir_arg, mac_arg = _parse_new_args(message.text)
         except ValueError as exc:
             await message.answer(f"⚠ {exc}")
             return
         cwd = Path(dir_arg).expanduser() if dir_arg else self.settings.project_root
-        if not cwd.is_dir():
-            await message.answer(f"⚠ directory does not exist: {cwd}")
+        runner_name = mac_arg or self.default_runner
+
+        # Validate runner is registered
+        try:
+            self.runners.get(runner_name)
+        except KeyError:
+            await message.answer(
+                f"⚠ no runner registered as {runner_name!r}. "
+                f"available: {', '.join(self.runners.names()) or '(none)'}"
+            )
             return
 
         try:
@@ -161,31 +198,46 @@ class BridgeBot:
             await message.answer(f"⚠ couldn't create topic: {exc!s}")
             return
 
-        runner = SessionRunner(
-            cwd=str(cwd),
-            permission_mode="acceptEdits",
-            on_session_id_assigned=self._make_id_persister(thread_id),
-        )
-        runner.on_permission_request = self._make_perm_handler(thread_id, runner)
+        sid = str(thread_id)
+
+        # Late-binding: handle callbacks need to reference the SessionHandle
+        # that we don't have until open_session returns.
+        handle_box: list[SessionHandle] = []
+
+        async def perm_handler(req: PermissionRequest) -> None:
+            await self.permissions_ui.render_card(
+                runner=handle_box[0],
+                chat_id=self.settings.telegram_chat_id,
+                thread_id=thread_id,
+                request=req,
+            )
 
         try:
-            await runner.start()
+            handle = await self.runners.get(runner_name).open_session(
+                sid=sid,
+                cwd=str(cwd),
+                mode="acceptEdits",
+                on_permission_request=perm_handler,
+                on_session_id_assigned=self._make_id_persister(thread_id),
+            )
         except Exception as exc:
-            log.exception("session.start_failed", name=name, cwd=str(cwd))
+            log.exception("session.open_failed", name=name, runner=runner_name, cwd=str(cwd))
             await self.bot.send_message(
                 chat_id=self.settings.telegram_chat_id,
                 message_thread_id=thread_id,
-                text=f"⚠ couldn't start session: {exc!r}",
+                text=f"⚠ couldn't open session on runner {runner_name!r}: {exc!s}",
             )
             return
+        handle_box.append(handle)
 
         await self.sessions.add(
             TopicSession(
                 thread_id=thread_id,
                 project_name=name,
                 cwd=str(cwd),
-                runner=runner,
+                runner=handle,
                 turn_lock=asyncio.Lock(),
+                runner_name=runner_name,
             )
         )
         await self.bot.send_message(
@@ -194,8 +246,9 @@ class BridgeBot:
             text=(
                 f"✓ session ready\n"
                 f"project: {name}\n"
-                f"cwd: {cwd}\n"
-                f"mode: acceptEdits  (use /permissions to change)\n\n"
+                f"cwd:     {cwd}\n"
+                f"runner:  {runner_name}\n"
+                f"mode:    acceptEdits  (use /permissions to change)\n\n"
                 f"Type a message to start."
             ),
         )
@@ -208,12 +261,12 @@ class BridgeBot:
         lines = ["active sessions:"]
         for s in active:
             lines.append(
-                f"  • {s.project_name}  ({s.cwd})  mode={s.runner.permission_mode}"
+                f"  • {s.project_name}  (runner={s.runner_name}, cwd={s.cwd})  "
+                f"mode={s.runner.permission_mode}"
             )
         await message.answer("\n".join(lines))
 
     async def cmd_permissions(self, message: Message) -> None:
-        # Only meaningful inside a topic
         if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
             await message.answer("/permissions only works inside a session topic")
             return
@@ -238,7 +291,7 @@ class BridgeBot:
             )
             return
         try:
-            await session.runner.set_permission_mode(mode)
+            await session.runner.set_permission_mode(mode)  # type: ignore[arg-type]
         except Exception as exc:
             await message.answer(f"⚠ couldn't change mode: {exc!r}")
             return
@@ -259,9 +312,9 @@ class BridgeBot:
             return
         self.permissions_ui.cancel_pending_for(session.runner)
         try:
-            await session.runner.stop()
+            await session.runner.close()
         except Exception:
-            log.exception("session.stop_failed", thread_id=session.thread_id)
+            log.exception("session.close_failed", thread_id=session.thread_id)
         await self.sessions.close(session.thread_id)
         await message.answer("✓ session closed. (topic remains; you can keep history.)")
 
@@ -282,33 +335,32 @@ class BridgeBot:
         renderer = TopicRenderer(self.bot, self.settings.telegram_chat_id, thread_id)
         async with session.turn_lock:
             try:
-                async for sdk_msg in session.runner.turn(message.text):
-                    await self._dispatch_sdk_message(sdk_msg, renderer)
+                async for env in session.runner.turn(message.text):
+                    await self._dispatch_envelope(env, renderer)
             except Exception as exc:
                 log.exception("turn.failed", thread_id=thread_id)
                 await renderer.render_error(f"turn failed: {exc!r}")
             else:
                 await self.sessions.touch(thread_id)
 
-    async def _dispatch_sdk_message(self, sdk_msg: Any, renderer: TopicRenderer) -> None:
-        if isinstance(sdk_msg, AssistantMessage):
-            for block in sdk_msg.content:
-                if isinstance(block, TextBlock):
-                    if block.text and block.text.strip():
-                        await renderer.render_text(block.text)
-                elif isinstance(block, ToolUseBlock):
-                    await renderer.render_tool_use(block.name, block.input)
-                elif isinstance(block, ThinkingBlock):
-                    await renderer.render_thinking()
-        elif isinstance(sdk_msg, UserMessage):
-            for block in sdk_msg.content:
-                if isinstance(block, ToolResultBlock):
-                    is_error = bool(getattr(block, "is_error", False))
-                    await renderer.render_tool_result(block.content, is_error)
-        elif isinstance(sdk_msg, ResultMessage):
-            return
-        elif isinstance(sdk_msg, SystemMessage):
-            # Silent for Phase 0 (init, hook lifecycle, etc.)
+    async def _dispatch_envelope(self, env: Envelope, renderer: TopicRenderer) -> None:
+        if env.type == T_TEXT:
+            text = env.payload.get("text", "")
+            if text and isinstance(text, str) and text.strip():
+                await renderer.render_text(text)
+        elif env.type == T_TOOL_USE:
+            await renderer.render_tool_use(
+                env.payload.get("name", ""), env.payload.get("input", {}) or {}
+            )
+        elif env.type == T_TOOL_RESULT:
+            await renderer.render_tool_result(
+                env.payload.get("content", ""),
+                bool(env.payload.get("is_error", False)),
+            )
+        elif env.type == T_THINKING:
+            await renderer.render_thinking()
+        elif env.type == T_SYSTEM:
+            # Silent for Phase 0/1/2 (init, hook lifecycle, etc.)
             return
 
     # ---- callback queries ---------------------------------------------------
@@ -316,23 +368,9 @@ class BridgeBot:
     async def on_callback(self, query: CallbackQuery) -> None:
         if await self.permissions_ui.handle_callback(query):
             return
-        # No other callback owners yet
         await query.answer()
 
     # ---- runner-side callbacks ---------------------------------------------
-
-    def _make_perm_handler(
-        self, thread_id: int, runner: SessionRunner
-    ) -> Callable[[PermissionRequest], Awaitable[None]]:
-        async def handler(req: PermissionRequest) -> None:
-            await self.permissions_ui.render_card(
-                runner=runner,
-                chat_id=self.settings.telegram_chat_id,
-                thread_id=thread_id,
-                request=req,
-            )
-
-        return handler
 
     def _make_id_persister(
         self, thread_id: int
@@ -346,44 +384,44 @@ class BridgeBot:
 
     async def restore_sessions(self) -> int:
         """Rehydrate sessions from the DB. For each persisted active session,
-        recreate a SessionRunner with `resume=sdk_session_id`. Returns the
-        count restored. Sessions that can't resume are marked orphaned in DB."""
+        ask the configured runner to open the session with `resume=`."""
 
-        async def factory(spec: RestoreSpec) -> SessionRunner:
-            # NOTE: capture spec.thread_id; we have to wire callbacks BEFORE
-            # we know the runner instance, so the perm_handler closure references
-            # the runner via late binding through a one-element list.
-            runner_box: list[SessionRunner] = []
+        async def factory(spec: RestoreSpec) -> SessionHandle:
+            handle_box: list[SessionHandle] = []
 
             async def perm_handler(req: PermissionRequest) -> None:
                 await self.permissions_ui.render_card(
-                    runner=runner_box[0],
+                    runner=handle_box[0],
                     chat_id=self.settings.telegram_chat_id,
                     thread_id=spec.thread_id,
                     request=req,
                 )
 
-            runner = SessionRunner(
+            # Phase 2: every restored session goes back to the default runner.
+            # Phase 3 will read spec.runner_name from the DB.
+            runner_name = self.default_runner
+            handle = await self.runners.get(runner_name).open_session(
+                sid=str(spec.thread_id),
                 cwd=spec.cwd,
-                permission_mode=spec.permission_mode,
+                mode=spec.permission_mode,  # type: ignore[arg-type]
                 resume=spec.sdk_session_id,
                 on_permission_request=perm_handler,
                 on_session_id_assigned=self._make_id_persister(spec.thread_id),
             )
-            runner_box.append(runner)
-            return runner
+            handle_box.append(handle)
+            return handle
 
-        n = await self.sessions.restore(factory)
+        n = await self.sessions.restore(factory, default_runner_name=self.default_runner)
         log.info("bridge.sessions_restored", count=n)
         return n
 
     # ---- lifecycle ----------------------------------------------------------
 
     async def shutdown(self) -> None:
-        """Stop every active session before the bot disconnects."""
         for s in self.sessions.all():
             self.permissions_ui.cancel_pending_for(s.runner)
             try:
-                await s.runner.stop()
+                await s.runner.close()
             except Exception:
-                log.exception("session.stop_failed", thread_id=s.thread_id)
+                log.exception("session.close_failed", thread_id=s.thread_id)
+        await self.runners.close_all()

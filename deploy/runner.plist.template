@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent template for the runner daemon. install.sh substitutes:
+    {{HOME}}        — $HOME of the runtime user
+    {{PROJECT_DIR}} — full path to the Claude-Telegram repo on this Mac
+    {{LABEL}}       — reverse-DNS-style identifier (e.g. uk.shahrestani.ct-runner)
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{LABEL}}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{HOME}}/.local/bin/uv</string>
+        <string>run</string>
+        <string>--project</string>
+        <string>{{PROJECT_DIR}}</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>ct.runner.main</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{{PROJECT_DIR}}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{{PROJECT_DIR}}/state/runner.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{PROJECT_DIR}}/state/runner.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

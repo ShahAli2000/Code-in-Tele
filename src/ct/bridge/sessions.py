@@ -1,9 +1,10 @@
 """Session store: in-memory runner registry, write-through to SQLite.
 
-The in-memory map (thread_id -> TopicSession) holds the live SessionRunner
-instances. Every mutation also lands in `Db` so the bot can rehydrate after a
-restart. `restore()` is the inverse — at boot it reads active rows from the DB
-and uses `runner_factory` to recreate live runners with `resume=sdk_session_id`.
+The in-memory map (thread_id -> TopicSession) holds live SessionHandle
+instances (proxies for runners on a runner daemon, possibly remote). Every
+mutation also lands in `Db` so the bot can rehydrate after a restart.
+`restore()` is the inverse — at boot it reads active rows from the DB and
+uses `runner_factory` to reopen each session with `resume=sdk_session_id`.
 """
 
 from __future__ import annotations
@@ -14,7 +15,8 @@ from dataclasses import dataclass
 
 import structlog
 
-from ct.sdk_adapter.adapter import PermissionMode, SessionRunner
+from ct.bridge.runner_client import SessionHandle
+from ct.sdk_adapter.adapter import PermissionMode
 from ct.store.db import Db
 
 log = structlog.get_logger(__name__)
@@ -27,16 +29,9 @@ class TopicSession:
     thread_id: int
     project_name: str
     cwd: str
-    runner: SessionRunner
+    runner: SessionHandle
     turn_lock: asyncio.Lock
-
-
-# Bridge supplies this when calling restore(). Given the persisted metadata for
-# a session, return a fully-wired SessionRunner (handlers attached) — but
-# don't call .start() yet; restore() does that.
-RunnerFactory = Callable[
-    ["RestoreSpec"], Awaitable[SessionRunner]
-]
+    runner_name: str = "studio"
 
 
 @dataclass
@@ -46,6 +41,15 @@ class RestoreSpec:
     cwd: str
     sdk_session_id: str | None
     permission_mode: PermissionMode
+    runner_name: str = "studio"
+
+
+# Bridge supplies this when calling restore(). Given the persisted metadata
+# for a session, return a fully-opened SessionHandle (turn_lock and DB row
+# are managed by SessionStore.restore itself).
+RunnerFactory = Callable[
+    ["RestoreSpec"], Awaitable[SessionHandle]
+]
 
 
 class SessionStore:
@@ -94,13 +98,16 @@ class SessionStore:
 
     # ---- restore-on-boot ---------------------------------------------------
 
-    async def restore(self, factory: RunnerFactory) -> int:
-        """For each active session in the DB, ask `factory` for a runner with
-        the right resume id, start it, and add to the in-memory map.
-
-        Returns the number of sessions successfully restored. Sessions whose
-        `sdk_session_id` is null (never had a first turn so no resumable id) or
-        whose resume fails are marked orphaned in the DB and skipped.
+    async def restore(
+        self,
+        factory: RunnerFactory,
+        *,
+        default_runner_name: str = "studio",
+    ) -> int:
+        """For each active session in the DB, ask `factory` to reopen it on
+        the appropriate runner with `resume=sdk_session_id`. Returns the count
+        successfully restored. Sessions whose `sdk_session_id` is null (never
+        had a first turn) or whose resume fails are marked orphaned + skipped.
         """
         rows = await self._db.list_active_sessions()
         restored = 0
@@ -121,10 +128,10 @@ class SessionStore:
                 cwd=row.cwd,
                 sdk_session_id=row.sdk_session_id,
                 permission_mode=row.permission_mode,  # type: ignore[arg-type]
+                runner_name=default_runner_name,
             )
             try:
-                runner = await factory(spec)
-                await runner.start()
+                handle = await factory(spec)
             except Exception as exc:
                 log.exception(
                     "session.restore_failed",
@@ -139,8 +146,9 @@ class SessionStore:
                 thread_id=row.thread_id,
                 project_name=row.project_name,
                 cwd=row.cwd,
-                runner=runner,
+                runner=handle,
                 turn_lock=asyncio.Lock(),
+                runner_name=default_runner_name,
             )
             restored += 1
             log.info(

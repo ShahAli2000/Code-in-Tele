@@ -1,0 +1,420 @@
+"""Runner daemon — hosts SessionRunner instances and exposes them over a
+WebSocket wire protocol so the bridge can drive them from another process
+(or another Mac, in Phase 3).
+
+Architecture:
+    websockets.serve()
+        ↓ one task per accepted connection
+    RunnerConnection
+        ├── reader: pulls envelopes off the WS, dispatches to handlers
+        ├── sessions: dict[str, RunnerSession]   # bridge-side id → SessionRunner
+        └── writer is just `await ws.send(frame(env, secret))` — no separate task
+
+Each RunnerSession holds one SessionRunner and the callbacks the bridge
+configured at open-time. Permission requests come up out of the SDK adapter,
+get translated into a `permission_request` envelope, and resolve when the
+bridge ships back a `decide` envelope.
+
+Session lifecycle (Phase 2):
+    open      → SessionRunner created + connected → opened
+    send X    → runner.turn(X), each SDK message translated to an envelope
+                stream; ResultMessage closes the turn
+    decide    → resolve_permission on the right session
+    set_mode  → set_permission_mode
+    interrupt → runner.interrupt()
+    close     → runner.stop(), session removed
+    (ws drop) → all sessions torn down (resume on reconnect is Phase 4 work)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import os
+import signal
+import sys
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Any
+
+import structlog
+import websockets
+from websockets.asyncio.server import ServerConnection, serve
+
+from claude_agent_sdk import (
+    AssistantMessage,
+    ResultMessage,
+    SystemMessage,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
+
+from ct.protocol.auth import frame, unframe
+from ct.protocol.envelopes import (
+    Envelope,
+    ProtocolError,
+    T_CLOSE,
+    T_CLOSED,
+    T_DECIDE,
+    T_ERROR,
+    T_INTERRUPT,
+    T_OPEN,
+    T_OPENED,
+    T_PERMISSION_REQUEST,
+    T_PING,
+    T_PONG,
+    T_SDK_ID,
+    T_SEND,
+    T_SET_MODE,
+    T_SYSTEM,
+    T_TEXT,
+    T_THINKING,
+    T_TOOL_RESULT,
+    T_TOOL_USE,
+    T_TURN_END,
+    closed_payload,
+    error_payload,
+    permission_request_payload,
+    sdk_id_payload,
+    system_payload,
+    text_payload,
+    tool_result_payload,
+    tool_use_payload,
+    turn_end_payload,
+)
+from ct.sdk_adapter.adapter import (
+    PermissionMode,
+    PermissionRequest,
+    SessionRunner,
+)
+
+log = structlog.get_logger(__name__)
+
+
+# ---- SDK -> envelope translation ----------------------------------------
+
+
+def _translate_assistant(msg: AssistantMessage, sid: str) -> list[Envelope]:
+    out: list[Envelope] = []
+    for block in msg.content:
+        if isinstance(block, TextBlock):
+            if block.text and block.text.strip():
+                out.append(Envelope(T_TEXT, sid, text_payload(block.text)))
+        elif isinstance(block, ToolUseBlock):
+            out.append(
+                Envelope(
+                    T_TOOL_USE,
+                    sid,
+                    tool_use_payload(
+                        tool_use_id=block.id, name=block.name, input=block.input
+                    ),
+                )
+            )
+        elif isinstance(block, ThinkingBlock):
+            out.append(Envelope(T_THINKING, sid, {}))
+        elif isinstance(block, ToolResultBlock):
+            # Tool results in an AssistantMessage are server-side tool returns.
+            out.append(_translate_tool_result_block(block, sid))
+    return out
+
+
+def _translate_user(msg: UserMessage, sid: str) -> list[Envelope]:
+    out: list[Envelope] = []
+    for block in msg.content:
+        if isinstance(block, ToolResultBlock):
+            out.append(_translate_tool_result_block(block, sid))
+    return out
+
+
+def _translate_tool_result_block(block: ToolResultBlock, sid: str) -> Envelope:
+    body = block.content if isinstance(block.content, str) else repr(block.content)
+    return Envelope(
+        T_TOOL_RESULT,
+        sid,
+        tool_result_payload(
+            tool_use_id=getattr(block, "tool_use_id", "") or "",
+            content=body,
+            is_error=bool(getattr(block, "is_error", False)),
+        ),
+    )
+
+
+def _translate_system(msg: SystemMessage, sid: str) -> Envelope:
+    return Envelope(
+        T_SYSTEM,
+        sid,
+        system_payload(subtype=msg.subtype or "", data=dict(msg.data or {})),
+    )
+
+
+def translate_sdk_message(msg: Any, sid: str) -> list[Envelope]:
+    """Map one SDK message object to zero or more wire envelopes."""
+    if isinstance(msg, AssistantMessage):
+        return _translate_assistant(msg, sid)
+    if isinstance(msg, UserMessage):
+        return _translate_user(msg, sid)
+    if isinstance(msg, SystemMessage):
+        return [_translate_system(msg, sid)]
+    # ResultMessage / RateLimitEvent / others handled by the caller (turn end
+    # boundary on ResultMessage; rate-limit events suppressed for now).
+    return []
+
+
+# ---- per-connection state -----------------------------------------------
+
+
+@dataclass
+class RunnerSession:
+    sid: str
+    runner: SessionRunner | None = None
+    turn_task: asyncio.Task[None] | None = None
+    closed: bool = False
+
+
+class RunnerConnection:
+    """One bridge ↔ runner WebSocket. Owns N session runners multiplexed by sid."""
+
+    def __init__(self, ws: ServerConnection, secret: bytes | None) -> None:
+        self.ws = ws
+        self.secret = secret
+        self.sessions: dict[str, RunnerSession] = {}
+        self._send_lock = asyncio.Lock()
+        self._next_seq = 0
+
+    async def serve(self) -> None:
+        peer = getattr(self.ws, "remote_address", "?")
+        log.info("runner.connection_opened", peer=str(peer))
+        try:
+            async for raw in self.ws:
+                if not isinstance(raw, str):
+                    continue
+                try:
+                    env = unframe(raw, self.secret)
+                except ProtocolError as exc:
+                    await self._send_error("", "protocol", str(exc))
+                    continue
+                # Dispatch is fire-and-forget so a long-running send doesn't
+                # block decide / interrupt for the same or a different session.
+                asyncio.create_task(self._dispatch(env))
+        except websockets.ConnectionClosed:
+            pass
+        except Exception:
+            log.exception("runner.connection_failed", peer=str(peer))
+        finally:
+            await self._teardown()
+            log.info("runner.connection_closed", peer=str(peer))
+
+    async def _teardown(self) -> None:
+        for s in list(self.sessions.values()):
+            s.closed = True
+            if s.turn_task is not None and not s.turn_task.done():
+                s.turn_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await s.turn_task
+            if s.runner is not None:
+                with contextlib.suppress(Exception):
+                    await s.runner.stop()
+        self.sessions.clear()
+
+    async def _send(self, env: Envelope) -> None:
+        self._next_seq += 1
+        env.seq = self._next_seq
+        line = frame(env, self.secret)
+        async with self._send_lock:
+            await self.ws.send(line)
+
+    async def _send_error(self, sid: str, kind: str, message: str) -> None:
+        await self._send(Envelope(T_ERROR, sid, error_payload(kind=kind, message=message)))
+
+    # ---- dispatch -------------------------------------------------------
+
+    async def _dispatch(self, env: Envelope) -> None:
+        try:
+            if env.type == T_OPEN:
+                await self._handle_open(env)
+            elif env.type == T_SEND:
+                await self._handle_send(env)
+            elif env.type == T_DECIDE:
+                await self._handle_decide(env)
+            elif env.type == T_SET_MODE:
+                await self._handle_set_mode(env)
+            elif env.type == T_INTERRUPT:
+                await self._handle_interrupt(env)
+            elif env.type == T_CLOSE:
+                await self._handle_close(env)
+            elif env.type == T_PING:
+                await self._send(Envelope(T_PONG, env.id, {}))
+            else:
+                await self._send_error(env.id, "unsupported_type", env.type)
+        except Exception as exc:
+            log.exception("runner.dispatch_failed", env_type=env.type, sid=env.id)
+            await self._send_error(env.id, "dispatch_failed", repr(exc))
+
+    async def _handle_open(self, env: Envelope) -> None:
+        if env.id in self.sessions:
+            await self._send_error(env.id, "duplicate", "session already open")
+            return
+        cwd = env.payload.get("cwd")
+        mode = env.payload.get("mode", "acceptEdits")
+        resume = env.payload.get("resume")
+        if not isinstance(cwd, str) or not cwd:
+            await self._send_error(env.id, "bad_request", "cwd is required")
+            return
+
+        session = RunnerSession(sid=env.id)
+        self.sessions[env.id] = session
+
+        async def perm_handler(req: PermissionRequest) -> None:
+            await self._send(
+                Envelope(
+                    T_PERMISSION_REQUEST,
+                    env.id,
+                    permission_request_payload(
+                        tool_use_id=req.tool_use_id,
+                        name=req.tool_name,
+                        input=req.input_data,
+                        agent_id=req.agent_id,
+                    ),
+                )
+            )
+
+        async def id_persister(sdk_session_id: str) -> None:
+            await self._send(Envelope(T_SDK_ID, env.id, sdk_id_payload(sdk_session_id)))
+
+        runner = SessionRunner(
+            cwd=cwd,
+            permission_mode=mode,  # type: ignore[arg-type]
+            resume=resume,
+            on_permission_request=perm_handler,
+            on_session_id_assigned=id_persister,
+        )
+        session.runner = runner
+        try:
+            await runner.start()
+        except Exception as exc:
+            self.sessions.pop(env.id, None)
+            await self._send_error(env.id, "open_failed", repr(exc))
+            return
+        # If we resumed, surface that id immediately; otherwise the SDK will
+        # emit it on the first turn.
+        if resume:
+            await self._send(Envelope(T_SDK_ID, env.id, sdk_id_payload(resume)))
+        await self._send(Envelope(T_OPENED, env.id, {}))
+
+    async def _handle_send(self, env: Envelope) -> None:
+        session = self.sessions.get(env.id)
+        if session is None or session.runner is None:
+            await self._send_error(env.id, "no_session", "open the session first")
+            return
+        text = env.payload.get("text")
+        if not isinstance(text, str):
+            await self._send_error(env.id, "bad_request", "send.text must be a string")
+            return
+        if session.turn_task is not None and not session.turn_task.done():
+            await self._send_error(env.id, "busy", "turn already in flight")
+            return
+        session.turn_task = asyncio.create_task(self._drive_turn(session, text))
+
+    async def _drive_turn(self, session: RunnerSession, text: str) -> None:
+        assert session.runner is not None
+        try:
+            async for msg in session.runner.turn(text):
+                if isinstance(msg, ResultMessage):
+                    break
+                for out in translate_sdk_message(msg, session.sid):
+                    await self._send(out)
+            await self._send(
+                Envelope(T_TURN_END, session.sid, turn_end_payload(reason="success"))
+            )
+        except asyncio.CancelledError:
+            await self._send(
+                Envelope(T_TURN_END, session.sid, turn_end_payload(reason="cancelled"))
+            )
+            raise
+        except Exception as exc:
+            log.exception("runner.turn_failed", sid=session.sid)
+            await self._send_error(session.sid, "turn_failed", repr(exc))
+            await self._send(
+                Envelope(T_TURN_END, session.sid, turn_end_payload(reason="error"))
+            )
+
+    async def _handle_decide(self, env: Envelope) -> None:
+        session = self.sessions.get(env.id)
+        if session is None or session.runner is None:
+            await self._send_error(env.id, "no_session", "open the session first")
+            return
+        p = env.payload
+        tool_use_id = p.get("tool_use_id")
+        allow = bool(p.get("allow", False))
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            await self._send_error(env.id, "bad_request", "decide.tool_use_id required")
+            return
+        await session.runner.resolve_permission(
+            tool_use_id,
+            allow=allow,
+            updated_input=p.get("updated_input"),
+            deny_message=p.get("deny_message", "User denied this action"),
+        )
+
+    async def _handle_set_mode(self, env: Envelope) -> None:
+        session = self.sessions.get(env.id)
+        if session is None or session.runner is None:
+            await self._send_error(env.id, "no_session", "open the session first")
+            return
+        mode = env.payload.get("mode")
+        if not isinstance(mode, str):
+            await self._send_error(env.id, "bad_request", "set_mode.mode required")
+            return
+        try:
+            await session.runner.set_permission_mode(mode)  # type: ignore[arg-type]
+        except Exception as exc:
+            await self._send_error(env.id, "set_mode_failed", repr(exc))
+
+    async def _handle_interrupt(self, env: Envelope) -> None:
+        session = self.sessions.get(env.id)
+        if session is None or session.runner is None:
+            return
+        await session.runner.interrupt()
+
+    async def _handle_close(self, env: Envelope) -> None:
+        session = self.sessions.pop(env.id, None)
+        if session is None:
+            return
+        session.closed = True
+        if session.turn_task is not None and not session.turn_task.done():
+            session.turn_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await session.turn_task
+        if session.runner is not None:
+            with contextlib.suppress(Exception):
+                await session.runner.stop()
+        await self._send(Envelope(T_CLOSED, env.id, closed_payload(reason="requested")))
+
+
+# ---- entry point --------------------------------------------------------
+
+
+async def run(host: str, port: int, secret: bytes | None) -> int:
+    async def handler(ws: ServerConnection) -> None:
+        await RunnerConnection(ws, secret).serve()
+
+    log.info("runner.starting", host=host, port=port, signed=secret is not None)
+    stop_event = asyncio.Event()
+
+    def _on_signal(signum: int) -> None:
+        log.info("runner.signal", signum=signum)
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _on_signal, sig)
+
+    async with serve(handler, host, port):
+        log.info("runner.listening", host=host, port=port)
+        await stop_event.wait()
+    log.info("runner.stopped")
+    return 0
