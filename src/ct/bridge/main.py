@@ -98,7 +98,9 @@ async def _run() -> int:
     await stop_event.wait()
     log.info("bridge.shutting_down")
 
-    bridge.dp.stop_polling.set() if hasattr(bridge.dp, "stop_polling") else None
+    # Aiogram 3: cancelling the task is the supported stop path. The dispatcher
+    # also exposes an awaitable stop_polling() coroutine, but cancellation is
+    # safer because it works regardless of the dispatcher's internal state.
     polling_task.cancel()
     try:
         await polling_task
