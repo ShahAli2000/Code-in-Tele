@@ -21,6 +21,7 @@ from aiogram.client.default import DefaultBotProperties
 
 from ct.bridge.bot import BridgeBot
 from ct.config import load_settings
+from ct.store.db import Db
 
 
 def _configure_logging(level: str, fmt: str) -> None:
@@ -56,7 +57,9 @@ async def _run() -> int:
         token=settings.telegram_bot_token,
         default=DefaultBotProperties(parse_mode=None),
     )
-    bridge = BridgeBot(bot=bot, settings=settings)
+    db = Db(settings.db_path)
+    await db.open()
+    bridge = BridgeBot(bot=bot, settings=settings, db=db)
 
     me = await bot.get_me()
     log.info(
@@ -65,7 +68,13 @@ async def _run() -> int:
         bot_id=me.id,
         chat_id=settings.telegram_chat_id,
         allowed_users=len(settings.telegram_allowed_user_ids),
+        db_path=str(settings.db_path),
     )
+
+    # Rehydrate active sessions from the DB before polling, so messages that
+    # land on an existing topic immediately route to a live runner.
+    restored = await bridge.restore_sessions()
+    log.info("bridge.ready", restored_sessions=restored)
 
     stop_event = asyncio.Event()
 
@@ -98,6 +107,7 @@ async def _run() -> int:
 
     await bridge.shutdown()
     await bot.session.close()
+    await db.close()
     log.info("bridge.stopped")
     return 0
 

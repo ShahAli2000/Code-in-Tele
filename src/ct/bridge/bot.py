@@ -29,7 +29,7 @@ from claude_agent_sdk import (
 )
 
 from ct.bridge.permissions_ui import PermissionsUI
-from ct.bridge.sessions import SessionStore, TopicSession
+from ct.bridge.sessions import RestoreSpec, SessionStore, TopicSession
 from ct.bridge.streaming import TopicRenderer
 from ct.bridge.topics import GENERAL_TOPIC_ID, create_topic
 from ct.config import Settings
@@ -38,6 +38,7 @@ from ct.sdk_adapter.adapter import (
     PermissionRequest,
     SessionRunner,
 )
+from ct.store.db import Db
 
 log = structlog.get_logger(__name__)
 
@@ -69,10 +70,11 @@ def _parse_new_args(text: str) -> tuple[str, str | None]:
 class BridgeBot:
     """One bot instance, one supergroup, many forum-topic sessions."""
 
-    def __init__(self, bot: Bot, settings: Settings) -> None:
+    def __init__(self, bot: Bot, settings: Settings, db: Db) -> None:
         self.bot = bot
         self.settings = settings
-        self.sessions = SessionStore()
+        self.db = db
+        self.sessions = SessionStore(db)
         self.permissions_ui = PermissionsUI(bot)
         self.dp = Dispatcher()
         self._router = Router()
@@ -159,7 +161,11 @@ class BridgeBot:
             await message.answer(f"⚠ couldn't create topic: {exc!s}")
             return
 
-        runner = SessionRunner(cwd=str(cwd), permission_mode="acceptEdits")
+        runner = SessionRunner(
+            cwd=str(cwd),
+            permission_mode="acceptEdits",
+            on_session_id_assigned=self._make_id_persister(thread_id),
+        )
         runner.on_permission_request = self._make_perm_handler(thread_id, runner)
 
         try:
@@ -173,7 +179,7 @@ class BridgeBot:
             )
             return
 
-        self.sessions.add(
+        await self.sessions.add(
             TopicSession(
                 thread_id=thread_id,
                 project_name=name,
@@ -236,6 +242,7 @@ class BridgeBot:
         except Exception as exc:
             await message.answer(f"⚠ couldn't change mode: {exc!r}")
             return
+        await self.sessions.update_permission_mode(session.thread_id, mode)
         await message.answer(
             f"✓ permission mode → {mode}\n"
             "(applies to the next tool request; any approval already waiting "
@@ -255,7 +262,7 @@ class BridgeBot:
             await session.runner.stop()
         except Exception:
             log.exception("session.stop_failed", thread_id=session.thread_id)
-        self.sessions.remove(session.thread_id)
+        await self.sessions.close(session.thread_id)
         await message.answer("✓ session closed. (topic remains; you can keep history.)")
 
     # ---- topic-text handler -------------------------------------------------
@@ -280,6 +287,8 @@ class BridgeBot:
             except Exception as exc:
                 log.exception("turn.failed", thread_id=thread_id)
                 await renderer.render_error(f"turn failed: {exc!r}")
+            else:
+                await self.sessions.touch(thread_id)
 
     async def _dispatch_sdk_message(self, sdk_msg: Any, renderer: TopicRenderer) -> None:
         if isinstance(sdk_msg, AssistantMessage):
@@ -310,7 +319,7 @@ class BridgeBot:
         # No other callback owners yet
         await query.answer()
 
-    # ---- permission handler factory ----------------------------------------
+    # ---- runner-side callbacks ---------------------------------------------
 
     def _make_perm_handler(
         self, thread_id: int, runner: SessionRunner
@@ -324,6 +333,49 @@ class BridgeBot:
             )
 
         return handler
+
+    def _make_id_persister(
+        self, thread_id: int
+    ) -> Callable[[str], Awaitable[None]]:
+        async def persist(sdk_session_id: str) -> None:
+            await self.sessions.update_sdk_session_id(thread_id, sdk_session_id)
+
+        return persist
+
+    # ---- restore-on-boot ----------------------------------------------------
+
+    async def restore_sessions(self) -> int:
+        """Rehydrate sessions from the DB. For each persisted active session,
+        recreate a SessionRunner with `resume=sdk_session_id`. Returns the
+        count restored. Sessions that can't resume are marked orphaned in DB."""
+
+        async def factory(spec: RestoreSpec) -> SessionRunner:
+            # NOTE: capture spec.thread_id; we have to wire callbacks BEFORE
+            # we know the runner instance, so the perm_handler closure references
+            # the runner via late binding through a one-element list.
+            runner_box: list[SessionRunner] = []
+
+            async def perm_handler(req: PermissionRequest) -> None:
+                await self.permissions_ui.render_card(
+                    runner=runner_box[0],
+                    chat_id=self.settings.telegram_chat_id,
+                    thread_id=spec.thread_id,
+                    request=req,
+                )
+
+            runner = SessionRunner(
+                cwd=spec.cwd,
+                permission_mode=spec.permission_mode,
+                resume=spec.sdk_session_id,
+                on_permission_request=perm_handler,
+                on_session_id_assigned=self._make_id_persister(spec.thread_id),
+            )
+            runner_box.append(runner)
+            return runner
+
+        n = await self.sessions.restore(factory)
+        log.info("bridge.sessions_restored", count=n)
+        return n
 
     # ---- lifecycle ----------------------------------------------------------
 

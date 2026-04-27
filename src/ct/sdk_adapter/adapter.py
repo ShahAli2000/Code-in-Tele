@@ -73,16 +73,21 @@ class SessionRunner:
         cwd: str,
         permission_mode: PermissionMode = "acceptEdits",
         on_permission_request: PermissionRequestHandler | None = None,
+        on_session_id_assigned: Callable[[str], Awaitable[None]] | None = None,
         resume: str | None = None,
         system_prompt: str | None = None,
     ) -> None:
         self.cwd = cwd
         self.permission_mode: PermissionMode = permission_mode
         self.on_permission_request = on_permission_request
+        self.on_session_id_assigned = on_session_id_assigned
         self.resume = resume
         self.system_prompt = system_prompt
 
-        self.session_id: str | None = None
+        # If we're resuming an existing SDK session, the bridge already knows
+        # the id — surface it immediately so callers can rely on it before the
+        # first turn produces an init message.
+        self.session_id: str | None = resume
 
         self._client: ClaudeSDKClient | None = None
         self._pending: dict[str, asyncio.Future[tuple[str, Any]]] = {}
@@ -157,6 +162,13 @@ class SessionRunner:
                 if sid and self.session_id is None:
                     self.session_id = sid
                     log.info("session.id_assigned", session_id=sid)
+                    if self.on_session_id_assigned is not None:
+                        try:
+                            await self.on_session_id_assigned(sid)
+                        except Exception:
+                            log.exception(
+                                "session.id_callback_failed", session_id=sid
+                            )
             yield msg
 
     # ---- runtime control ----------------------------------------------------
