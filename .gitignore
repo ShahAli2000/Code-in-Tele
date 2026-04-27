@@ -1,0 +1,60 @@
+# --- Secrets (NEVER commit real values) ---
+.env
+.env.*
+!.env.example
+*.secret
+*.key
+*.pem
+secrets/
+credentials/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.venv/
+venv/
+env/
+.uv/
+.python-version
+
+# --- Build / dist ---
+build/
+dist/
+*.whl
+*.tar.gz
+
+# --- Tooling caches ---
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.tox/
+htmlcov/
+.coverage
+.coverage.*
+
+# --- State / data (may contain chat content, do not leak) ---
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+data/
+state/
+logs/
+*.log
+
+# --- macOS / IDE noise ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+.cursor/
+
+# --- Project-specific ---
+# launchd plists with real paths/secrets baked in (templates go under deploy/)
+deploy/local-*.plist
