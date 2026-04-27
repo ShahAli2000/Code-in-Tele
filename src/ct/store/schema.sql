@@ -1,6 +1,8 @@
 -- Schema is idempotent (CREATE IF NOT EXISTS) so it's safe to run on every boot.
 
--- Phase 1: one row per Telegram forum topic that the bridge is tracking.
+-- Phase 1+: one row per Telegram forum topic that the bridge is tracking.
+-- runner_name added in v3 — without it, restore always tried the default
+-- runner regardless of where the session was originally created.
 CREATE TABLE IF NOT EXISTS sessions (
     thread_id        INTEGER PRIMARY KEY,           -- Telegram message_thread_id
     project_name     TEXT    NOT NULL,
@@ -8,6 +10,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     sdk_session_id   TEXT,                          -- nullable; assigned on first turn
     permission_mode  TEXT    NOT NULL,
     state            TEXT    NOT NULL DEFAULT 'active',  -- 'active' | 'closed' | 'orphaned'
+    runner_name      TEXT    NOT NULL DEFAULT 'studio',
     created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
     last_activity    TEXT    NOT NULL DEFAULT (datetime('now'))
 );
@@ -30,4 +33,4 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
-INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '2');
+INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '3');

@@ -69,6 +69,7 @@ class SessionStore:
             project_name=session.project_name,
             cwd=session.cwd,
             permission_mode=session.runner.permission_mode,
+            runner_name=session.runner_name,
         )
         self._by_thread[session.thread_id] = session
 
@@ -128,7 +129,7 @@ class SessionStore:
                 cwd=row.cwd,
                 sdk_session_id=row.sdk_session_id,
                 permission_mode=row.permission_mode,  # type: ignore[arg-type]
-                runner_name=default_runner_name,
+                runner_name=row.runner_name or default_runner_name,
             )
             try:
                 handle = await factory(spec)
@@ -148,7 +149,7 @@ class SessionStore:
                 cwd=row.cwd,
                 runner=handle,
                 turn_lock=asyncio.Lock(),
-                runner_name=default_runner_name,
+                runner_name=spec.runner_name,
             )
             restored += 1
             log.info(

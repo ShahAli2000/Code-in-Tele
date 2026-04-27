@@ -85,6 +85,11 @@ class BridgeBot:
         self.db = db
         self.runners = runner_pool
         self.runners.on_reconnect = self.on_runner_reconnect
+        # Wire the callback onto any RunnerConnections that already exist
+        # (main.py adds the studio runner + DB-registered macs before
+        # constructing the bridge, so they were created with on_reconnect=None).
+        for _conn in self.runners._connections.values():  # type: ignore[attr-defined]
+            _conn.on_reconnect = self.on_runner_reconnect
         self.default_runner = default_runner
         self.sessions = SessionStore(db)
         self.permissions_ui = PermissionsUI(bot)
@@ -509,9 +514,19 @@ class BridgeBot:
                     request=req,
                 )
 
-            # Phase 2: every restored session goes back to the default runner.
-            # Phase 3 will read spec.runner_name from the DB.
-            runner_name = self.default_runner
+            # Use the runner the session was originally on. Falls back to
+            # default if that runner is no longer registered (e.g. user did
+            # /macs remove). The restore call will then either succeed on
+            # default or fail and mark the session orphaned.
+            runner_name = spec.runner_name
+            if runner_name not in self.runners.names():
+                log.warning(
+                    "bridge.session_runner_missing_falling_back",
+                    thread_id=spec.thread_id,
+                    requested=runner_name,
+                    fallback=self.default_runner,
+                )
+                runner_name = self.default_runner
             handle = await self.runners.get(runner_name).open_session(
                 sid=str(spec.thread_id),
                 cwd=spec.cwd,

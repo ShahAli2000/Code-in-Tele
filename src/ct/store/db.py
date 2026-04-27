@@ -29,6 +29,7 @@ class SessionRow:
     state: str
     created_at: str
     last_activity: str
+    runner_name: str = "studio"
 
 
 @dataclass
@@ -48,7 +49,8 @@ class Db:
         self._conn: aiosqlite.Connection | None = None
 
     async def open(self) -> None:
-        """Create the parent dir if needed, open the connection, run schema.sql."""
+        """Create the parent dir if needed, open the connection, run schema.sql,
+        then apply any forward-only column migrations."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(self.path)
         # Make foreign-key checks the default; let SQLite manage WAL for crash safety.
@@ -56,8 +58,20 @@ class Db:
         await self._conn.execute("PRAGMA journal_mode = WAL")
         schema = _SCHEMA_PATH.read_text()
         await self._conn.executescript(schema)
+        await self._migrate()
         await self._conn.commit()
         log.info("db.opened", path=str(self.path))
+
+    async def _migrate(self) -> None:
+        """Add columns that CREATE IF NOT EXISTS can't introduce on existing
+        tables. Each block here is idempotent — safe to run on every boot."""
+        async with self.conn.execute("PRAGMA table_info(sessions)") as cur:
+            session_cols = {row[1] for row in await cur.fetchall()}
+        if "runner_name" not in session_cols:
+            await self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN runner_name TEXT NOT NULL DEFAULT 'studio'"
+            )
+            log.info("db.migrated", change="sessions.runner_name added")
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -79,14 +93,15 @@ class Db:
         project_name: str,
         cwd: str,
         permission_mode: str,
+        runner_name: str = "studio",
     ) -> None:
         await self.conn.execute(
             """
             INSERT OR REPLACE INTO sessions(
-                thread_id, project_name, cwd, permission_mode, state
-            ) VALUES (?, ?, ?, ?, 'active')
+                thread_id, project_name, cwd, permission_mode, state, runner_name
+            ) VALUES (?, ?, ?, ?, 'active', ?)
             """,
-            (thread_id, project_name, cwd, permission_mode),
+            (thread_id, project_name, cwd, permission_mode, runner_name),
         )
         await self.conn.commit()
 
@@ -128,7 +143,8 @@ class Db:
 
     async def get_session(self, thread_id: int) -> Optional[SessionRow]:
         async with self.conn.execute(
-            "SELECT thread_id, project_name, cwd, sdk_session_id, permission_mode, state, created_at, last_activity "
+            "SELECT thread_id, project_name, cwd, sdk_session_id, permission_mode, state, "
+            "created_at, last_activity, runner_name "
             "FROM sessions WHERE thread_id = ?",
             (thread_id,),
         ) as cur:
@@ -139,7 +155,8 @@ class Db:
 
     async def list_active_sessions(self) -> list[SessionRow]:
         async with self.conn.execute(
-            "SELECT thread_id, project_name, cwd, sdk_session_id, permission_mode, state, created_at, last_activity "
+            "SELECT thread_id, project_name, cwd, sdk_session_id, permission_mode, state, "
+            "created_at, last_activity, runner_name "
             "FROM sessions WHERE state = 'active' ORDER BY created_at"
         ) as cur:
             rows = await cur.fetchall()
