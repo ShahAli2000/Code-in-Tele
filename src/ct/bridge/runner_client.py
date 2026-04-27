@@ -80,6 +80,7 @@ SdkIdHandler = Callable[[str], Awaitable[None]]
 @dataclass
 class _SessionState:
     sid: str
+    cwd: str
     on_permission_request: PermissionHandler | None
     on_session_id_assigned: SdkIdHandler | None
     sdk_session_id: str | None = None
@@ -182,21 +183,43 @@ class SessionHandle:
 
 
 class RunnerConnection:
-    """One WebSocket connection to one runner daemon."""
+    """One WebSocket connection to one runner daemon, with auto-reconnect.
 
-    def __init__(self, *, name: str, host: str, port: int, secret: bytes | None) -> None:
+    When the underlying WS dies (peer down, network blip, runner restart),
+    the reader loop schedules a reconnect with exponential backoff and, on
+    success, re-issues T_OPEN(resume=sdk_session_id) for every session it
+    was tracking. In-flight turns get a synthetic error envelope so the
+    bridge surfaces the disconnect to the user without hanging.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        host: str,
+        port: int,
+        secret: bytes | None,
+        on_reconnect: Callable[[str, list[str]], Awaitable[None]] | None = None,
+    ) -> None:
         self.name = name
         self.host = host
         self.port = port
         self.secret = secret
+        self.on_reconnect = on_reconnect
         self._ws: ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
         self._sessions: dict[str, _SessionState] = {}
         self._send_lock = asyncio.Lock()
+        self._auto_reconnect = True
 
     @property
     def url(self) -> str:
         return f"ws://{self.host}:{self.port}"
+
+    @property
+    def connected(self) -> bool:
+        return self._ws is not None
 
     async def connect(self) -> None:
         if self._ws is not None:
@@ -209,6 +232,15 @@ class RunnerConnection:
         log.info("runner_client.connected", name=self.name)
 
     async def close(self) -> None:
+        # Suppress auto-reconnect first so a final WS close doesn't trigger
+        # one more reconnect spin.
+        self._auto_reconnect = False
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reconnect_task
+            self._reconnect_task = None
+
         for state in list(self._sessions.values()):
             state.closed.set()
             if state.turn_queue is not None:
@@ -237,11 +269,113 @@ class RunnerConnection:
                     continue
                 await self._dispatch(env)
         except websockets.ConnectionClosed:
-            log.info("runner_client.disconnected", name=self.name)
+            pass
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("runner_client.reader_failed", name=self.name)
+        # Reader exited (ws closed). Decide whether to reconnect.
+        await self._on_disconnect()
+
+    async def _on_disconnect(self) -> None:
+        log.info(
+            "runner_client.disconnected",
+            name=self.name,
+            sessions=len(self._sessions),
+            will_reconnect=self._auto_reconnect,
+        )
+        self._ws = None
+        # Fail any in-flight turns so iterators exit cleanly.
+        for state in self._sessions.values():
+            if state.turn_queue is not None:
+                err = Envelope(
+                    T_ERROR,
+                    state.sid,
+                    {"kind": "runner_disconnected",
+                     "message": f"runner {self.name!r} dropped — will reconnect"},
+                )
+                state.turn_queue.put_nowait(err)
+        if self._auto_reconnect and self._reconnect_task is None:
+            self._reconnect_task = asyncio.create_task(
+                self._reconnect_loop(), name=f"runner-reconnect-{self.name}"
+            )
+
+    async def _reconnect_loop(self) -> None:
+        """Try to re-establish the WS forever (until close() is called).
+        Backoff: 1s, 2s, 5s, 15s, 60s cap."""
+        delays = [1.0, 2.0, 5.0, 15.0]
+        attempt = 0
+        try:
+            while self._auto_reconnect:
+                attempt += 1
+                delay = delays[min(attempt - 1, len(delays) - 1)] if attempt <= len(delays) else 60.0
+                try:
+                    new_ws = await connect(self.url)
+                except (OSError, ConnectionRefusedError) as exc:
+                    log.info(
+                        "runner_client.reconnect_attempt_failed",
+                        name=self.name,
+                        attempt=attempt,
+                        next_delay=delay,
+                        error=str(exc),
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                # Success.
+                self._ws = new_ws
+                self._reader_task = asyncio.create_task(
+                    self._reader_loop(), name=f"runner-reader-{self.name}"
+                )
+                log.info(
+                    "runner_client.reconnected",
+                    name=self.name,
+                    after_attempts=attempt,
+                    sessions=len(self._sessions),
+                )
+                reopened = await self._reopen_sessions()
+                if self.on_reconnect is not None and reopened:
+                    try:
+                        await self.on_reconnect(self.name, reopened)
+                    except Exception:
+                        log.exception("runner_client.on_reconnect_callback_failed")
+                return
+        finally:
+            self._reconnect_task = None
+
+    async def _reopen_sessions(self) -> list[str]:
+        """Re-issue T_OPEN(resume=) for each tracked session. Returns the
+        list of sids that were successfully re-opened."""
+        reopened: list[str] = []
+        for sid, state in list(self._sessions.items()):
+            if state.sdk_session_id is None:
+                # Never had a first turn — no resumable id. Drop it; the bridge
+                # will see the closed event and report.
+                log.info("runner_client.dropping_unresumable", sid=sid)
+                state.closed.set()
+                if state.turn_queue is not None:
+                    state.turn_queue.put_nowait(None)
+                self._sessions.pop(sid, None)
+                continue
+            # Reset opened so a fresh wait() blocks until OPENED arrives.
+            state.opened.clear()
+            state.open_error = None
+            try:
+                await self._send(
+                    Envelope(
+                        "open",
+                        sid,
+                        {
+                            "cwd": state.cwd,
+                            "mode": state.permission_mode,
+                            "resume": state.sdk_session_id,
+                        },
+                    )
+                )
+            except Exception:
+                log.exception("runner_client.reopen_send_failed", sid=sid)
+                continue
+            reopened.append(sid)
+        return reopened
 
     async def _dispatch(self, env: Envelope) -> None:
         state = self._sessions.get(env.id)
@@ -324,6 +458,7 @@ class RunnerConnection:
             raise RuntimeError(f"session {sid} already open on runner {self.name!r}")
         state = _SessionState(
             sid=sid,
+            cwd=cwd,
             on_permission_request=on_permission_request,
             on_session_id_assigned=on_session_id_assigned,
             permission_mode=mode,
@@ -347,8 +482,13 @@ class RunnerConnection:
 class RunnerPool:
     """Many named runners; the bridge picks one when starting a session."""
 
-    def __init__(self, secret: bytes | None) -> None:
+    def __init__(
+        self,
+        secret: bytes | None,
+        on_reconnect: Callable[[str, list[str]], Awaitable[None]] | None = None,
+    ) -> None:
         self.secret = secret
+        self.on_reconnect = on_reconnect
         self._connections: dict[str, RunnerConnection] = {}
 
     async def add_runner(
@@ -370,7 +510,13 @@ class RunnerPool:
             raise RuntimeError(f"runner {name!r} already registered")
         last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
-            conn = RunnerConnection(name=name, host=host, port=port, secret=self.secret)
+            conn = RunnerConnection(
+                name=name,
+                host=host,
+                port=port,
+                secret=self.secret,
+                on_reconnect=self.on_reconnect,
+            )
             try:
                 await conn.connect()
             except (OSError, ConnectionRefusedError) as exc:

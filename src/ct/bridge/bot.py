@@ -84,6 +84,7 @@ class BridgeBot:
         self.settings = settings
         self.db = db
         self.runners = runner_pool
+        self.runners.on_reconnect = self.on_runner_reconnect
         self.default_runner = default_runner
         self.sessions = SessionStore(db)
         self.permissions_ui = PermissionsUI(bot)
@@ -458,6 +459,30 @@ class BridgeBot:
         await query.answer()
 
     # ---- runner-side callbacks ---------------------------------------------
+
+    async def on_runner_reconnect(self, name: str, sids: list[str]) -> None:
+        """Called by RunnerPool after a runner's WS reconnects. Post a sticky
+        note in each topic whose session was just re-opened with resume=."""
+        log.info("bridge.runner_reconnected", name=name, sessions=sids)
+        for sid in sids:
+            try:
+                thread_id = int(sid)
+            except ValueError:
+                continue
+            session = self.sessions.get(thread_id)
+            if session is None:
+                continue
+            try:
+                await self.bot.send_message(
+                    chat_id=self.settings.telegram_chat_id,
+                    message_thread_id=thread_id,
+                    text=(
+                        f"⚡ runner {name!r} reconnected — session resumed.\n"
+                        f"any in-flight turn was lost; re-send your last message if needed."
+                    ),
+                )
+            except Exception:
+                log.exception("bridge.reconnect_announce_failed", thread_id=thread_id)
 
     def _make_id_persister(
         self, thread_id: int
