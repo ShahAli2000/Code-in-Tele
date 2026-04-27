@@ -24,11 +24,21 @@ if [[ ! -f "$PROJECT_DIR/.env" ]]; then
     echo "✗ no .env in $PROJECT_DIR — copy .env.example and fill it in first." >&2
     exit 1
 fi
-if [[ ! -x "$HOME/.local/bin/uv" ]]; then
-    echo "✗ uv not found at \$HOME/.local/bin/uv. Install with:" >&2
+UV_PATH="$(command -v uv 2>/dev/null || true)"
+if [[ -z "$UV_PATH" ]]; then
+    if [[ -x "$HOME/.local/bin/uv" ]]; then
+        UV_PATH="$HOME/.local/bin/uv"
+    elif [[ -x "/opt/homebrew/bin/uv" ]]; then
+        UV_PATH="/opt/homebrew/bin/uv"
+    fi
+fi
+if [[ -z "$UV_PATH" || ! -x "$UV_PATH" ]]; then
+    echo "✗ uv not on PATH. Install with:" >&2
     echo "    curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
+    echo "  (or: brew install uv)" >&2
     exit 1
 fi
+echo "✓ uv found at $UV_PATH"
 if [[ "$BRIDGE_ENABLED" = "1" || "$RUNNER_ENABLED" = "1" ]]; then
     if [[ ! -x "$HOME/.local/bin/claude" ]]; then
         echo "⚠ Claude Code CLI not found at \$HOME/.local/bin/claude." >&2
@@ -46,6 +56,7 @@ render_plist() {
         -e "s|{{HOME}}|$HOME|g" \
         -e "s|{{PROJECT_DIR}}|$PROJECT_DIR|g" \
         -e "s|{{LABEL}}|$label|g" \
+        -e "s|{{UV_PATH}}|$UV_PATH|g" \
         "$template" > "$target"
     echo "  ✓ wrote $target"
 }
@@ -65,7 +76,7 @@ reload_agent() {
 }
 
 # Sync deps (.venv must exist before launchd runs uv on a fresh deploy)
-"$HOME/.local/bin/uv" sync --project "$PROJECT_DIR" >/dev/null
+"$UV_PATH" sync --project "$PROJECT_DIR" >/dev/null
 echo "✓ uv sync ok"
 
 if [[ "$RUNNER_ENABLED" = "1" ]]; then

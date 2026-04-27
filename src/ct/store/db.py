@@ -31,6 +31,15 @@ class SessionRow:
     last_activity: str
 
 
+@dataclass
+class MacRow:
+    name: str
+    host: str
+    port: int
+    added_at: str
+    last_connected: str | None
+
+
 class Db:
     """Async SQLite handle. One instance per process; safe to share across coroutines."""
 
@@ -135,3 +144,34 @@ class Db:
         ) as cur:
             rows = await cur.fetchall()
         return [SessionRow(*r) for r in rows]
+
+    # ---- macs ---------------------------------------------------------------
+
+    async def insert_mac(self, name: str, host: str, port: int) -> None:
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO macs(name, host, port) VALUES (?, ?, ?)",
+            (name, host, port),
+        )
+        await self.conn.commit()
+
+    async def remove_mac(self, name: str) -> bool:
+        async with self.conn.execute(
+            "DELETE FROM macs WHERE name = ?", (name,)
+        ) as cur:
+            deleted = cur.rowcount or 0
+        await self.conn.commit()
+        return deleted > 0
+
+    async def update_mac_connected(self, name: str) -> None:
+        await self.conn.execute(
+            "UPDATE macs SET last_connected = datetime('now') WHERE name = ?",
+            (name,),
+        )
+        await self.conn.commit()
+
+    async def list_macs(self) -> list[MacRow]:
+        async with self.conn.execute(
+            "SELECT name, host, port, added_at, last_connected FROM macs ORDER BY name"
+        ) as cur:
+            rows = await cur.fetchall()
+        return [MacRow(*r) for r in rows]

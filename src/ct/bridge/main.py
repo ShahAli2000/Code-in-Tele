@@ -84,6 +84,23 @@ async def _run() -> int:
             f"is the runner LaunchAgent loaded? ({exc!r})"
         ) from exc
 
+    # Reconnect every previously-registered remote mac. Failures here are
+    # warnings, not fatal — a mac being asleep shouldn't block the bridge.
+    log_main = structlog.get_logger("ct.bridge.main")
+    for mac in await db.list_macs():
+        try:
+            await runners.add_runner(
+                name=mac.name, host=mac.host, port=mac.port,
+                max_attempts=3, retry_interval=1.5,
+            )
+            await db.update_mac_connected(mac.name)
+            log_main.info("bridge.mac_reconnected", name=mac.name, host=mac.host, port=mac.port)
+        except Exception as exc:
+            log_main.warning(
+                "bridge.mac_unreachable",
+                name=mac.name, host=mac.host, port=mac.port, error=str(exc),
+            )
+
     bridge = BridgeBot(
         bot=bot, settings=settings, db=db, runner_pool=runners,
         default_runner="studio",

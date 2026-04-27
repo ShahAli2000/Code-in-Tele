@@ -14,7 +14,7 @@
     <string>{{LABEL}}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{{HOME}}/.local/bin/uv</string>
+        <string>{{UV_PATH}}</string>
         <string>run</string>
         <string>--project</string>
         <string>{{PROJECT_DIR}}</string>

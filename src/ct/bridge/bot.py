@@ -44,35 +44,28 @@ VALID_MODES: tuple[PermissionMode, ...] = (
 
 
 def _parse_new_args(text: str) -> tuple[str, str | None, str | None]:
-    """Parse `/new <name> [dir=<path>] [mac=<runner-name>]`.
-    Returns (name, dir-or-None, mac-or-None)."""
-    parts = text.strip().split(maxsplit=1)
-    if len(parts) < 2:
+    """Parse `/new <name>... [dir=<path>] [mac=<runner>]`. Tokens are split on
+    whitespace; any `key=value` token is consumed as that flag, anything else
+    becomes part of the project name. Args can appear in any order."""
+    tokens = text.strip().split()
+    if len(tokens) < 2:
         raise ValueError("usage: /new <name> [dir=<path>] [mac=<runner>]")
-    rest = parts[1].strip()
-    name = rest
+
+    name_parts: list[str] = []
     cwd: str | None = None
     mac: str | None = None
-    if " dir=" in rest:
-        idx = rest.index(" dir=")
-        name = rest[:idx].strip()
-        rest = rest[idx + 1:]  # keep the rest including 'dir=...'
-    if " mac=" in rest:
-        idx = rest.index(" mac=")
-        if cwd is None:
-            # `mac=` came before any `dir=` parsing
-            name = rest[:idx].strip() if name == rest else name
-        rest_after_mac = rest[idx + len(" mac="):].strip()
-        # Take up to next space
-        mac = rest_after_mac.split()[0] if rest_after_mac else None
-        rest = rest[:idx]
-    if rest.startswith("dir="):
-        cwd = rest[len("dir="):].strip()
-    elif "dir=" in rest:
-        cwd = rest[rest.index("dir=") + len("dir="):].strip()
+    for token in tokens[1:]:  # skip the '/new'
+        if token.startswith("dir="):
+            cwd = token[len("dir="):]
+        elif token.startswith("mac="):
+            mac = token[len("mac="):]
+        else:
+            name_parts.append(token)
+
+    name = " ".join(name_parts)
     if not name:
         raise ValueError("project name can't be empty")
-    return name, cwd, mac
+    return name, cwd or None, mac or None
 
 
 class BridgeBot:
@@ -161,6 +154,34 @@ class BridgeBot:
         )
 
     async def cmd_macs(self, message: Message) -> None:
+        if message.text is None:
+            return
+        parts = message.text.strip().split()
+        # `/macs` or `/macs list` -> show; `/macs add ...` / `/macs remove ...` -> mutate
+        if len(parts) <= 1 or parts[1] == "list":
+            await self._macs_list(message)
+        elif parts[1] == "add" and len(parts) >= 4:
+            name = parts[2]
+            host = parts[3]
+            port = self.settings.runner_port
+            # support `host:port` and trailing-arg port
+            if ":" in host and host.rsplit(":", 1)[-1].isdigit():
+                host, port_s = host.rsplit(":", 1)
+                port = int(port_s)
+            elif len(parts) >= 5 and parts[4].isdigit():
+                port = int(parts[4])
+            await self._macs_add(message, name, host, port)
+        elif parts[1] == "remove" and len(parts) >= 3:
+            await self._macs_remove(message, parts[2])
+        else:
+            await message.answer(
+                "usage:\n"
+                "  /macs                       — list registered runners\n"
+                "  /macs add NAME HOST [PORT]  — register a runner over Tailscale\n"
+                "  /macs remove NAME           — drop a runner"
+            )
+
+    async def _macs_list(self, message: Message) -> None:
         names = self.runners.names()
         if not names:
             await message.answer("no runners registered.")
@@ -170,6 +191,62 @@ class BridgeBot:
             conn = self.runners.get(n)
             lines.append(f"  • {n}  ({conn.host}:{conn.port})")
         await message.answer("\n".join(lines))
+
+    async def _macs_add(
+        self, message: Message, name: str, host: str, port: int
+    ) -> None:
+        if name == self.default_runner:
+            await message.answer(
+                f"⚠ {name!r} is the implicit local runner; pick another name."
+            )
+            return
+        if name in self.runners.names():
+            await message.answer(f"⚠ {name!r} is already registered.")
+            return
+        try:
+            # Fewer attempts here than at boot — interactive caller would
+            # rather see a fast no than wait 30 s.
+            await self.runners.add_runner(
+                name=name, host=host, port=port, max_attempts=3, retry_interval=1.5
+            )
+        except Exception as exc:
+            await message.answer(f"⚠ couldn't connect to {host}:{port}: {exc!s}")
+            return
+        await self.db.insert_mac(name, host, port)
+        await self.db.update_mac_connected(name)
+        await message.answer(
+            f"✓ {name} registered ({host}:{port}).\n"
+            f"use it with: /new <project> mac={name} dir=<path>"
+        )
+
+    async def _macs_remove(self, message: Message, name: str) -> None:
+        if name == self.default_runner:
+            await message.answer(
+                f"⚠ can't remove the local {self.default_runner!r} runner."
+            )
+            return
+        # Refuse if any active session is bound to that mac.
+        bound = [s for s in self.sessions.all() if s.runner_name == name]
+        if bound:
+            names = ", ".join(s.project_name for s in bound)
+            await message.answer(
+                f"⚠ {name!r} has active sessions ({names}); /close them first."
+            )
+            return
+        try:
+            conn = self.runners.get(name)
+        except KeyError:
+            removed_db = await self.db.remove_mac(name)
+            if removed_db:
+                await message.answer(f"✓ {name} removed (was in DB but not connected).")
+            else:
+                await message.answer(f"⚠ no runner registered as {name!r}.")
+            return
+        await conn.close()
+        # Drop from pool and DB
+        self.runners._connections.pop(name, None)  # type: ignore[attr-defined]
+        await self.db.remove_mac(name)
+        await message.answer(f"✓ {name} disconnected and removed.")
 
     async def cmd_new(self, message: Message) -> None:
         if message.text is None:
