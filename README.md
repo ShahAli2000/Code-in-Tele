@@ -92,14 +92,45 @@ cp .env.example .env
 
 ## Local development
 
-Once Phase 0 is wired up:
-
 ```bash
 uv sync                              # install deps (.venv created automatically)
 uv run python -m ct.bridge.main      # start the bridge
 ```
 
-In the supergroup's General topic, type `/new test` — the bot should create a topic and respond. Then send a message in that topic to talk to Claude.
+In the supergroup's General topic, type `/new test` — the bot creates a topic and posts a "session ready" message. Then send a message in that topic to talk to Claude.
+
+## Deploy to an always-on Mac (Mac Studio)
+
+The bot stays useful only if it's always reachable, so production lives on an always-on Mac under `launchd`. All inter-Mac comms go over Tailscale.
+
+```bash
+# On the always-on Mac, one-time setup:
+curl -LsSf https://astral.sh/uv/install.sh | sh             # Python toolchain
+curl -fsSL https://claude.ai/install.sh | bash              # Claude Code CLI
+~/.local/bin/claude                                         # then in the prompt: /login
+
+# Sync the repo to the Mac (rsync over Tailscale; .env transfers too):
+rsync -azP --exclude='.venv/' --exclude='__pycache__/' --exclude='state/' \
+    /path/to/Claude-Telegram/ ali@<tailnet-ip>:~/Local-Files/Main-Apps/Claude-Telegram/
+
+# Install + start the LaunchAgent:
+ssh ali@<tailnet-ip> 'bash ~/Local-Files/Main-Apps/Claude-Telegram/deploy/install.sh'
+```
+
+`install.sh` is idempotent — re-run it after `git pull` (or another rsync) to pick up plist or code changes.
+
+Logs live at `state/bridge.log`. Tail them with:
+
+```bash
+ssh ali@<tailnet-ip> 'tail -F ~/Local-Files/Main-Apps/Claude-Telegram/state/bridge.log'
+```
+
+To uninstall:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/uk.shahrestani.ct-bridge.plist
+rm ~/Library/LaunchAgents/uk.shahrestani.ct-bridge.plist
+```
 
 ## Repository layout
 
