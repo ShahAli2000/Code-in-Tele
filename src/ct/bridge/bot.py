@@ -192,6 +192,16 @@ class BridgeBot:
             )
             return
 
+        # Validate cwd exists. For the local "studio" runner the bridge and
+        # runner share a filesystem so this check is authoritative; for remote
+        # runners (Phase 3) we skip the local check and let the runner reject.
+        if runner_name == self.default_runner and not cwd.is_dir():
+            await message.answer(
+                f"⚠ directory does not exist on {runner_name}: {cwd}\n"
+                f"create it first, or pass a different dir=<path>"
+            )
+            return
+
         try:
             thread_id = await create_topic(self.bot, self.settings.telegram_chat_id, name)
         except TelegramBadRequest as exc:
