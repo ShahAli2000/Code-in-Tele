@@ -11,9 +11,29 @@ CREATE TABLE IF NOT EXISTS sessions (
     permission_mode  TEXT    NOT NULL,
     state            TEXT    NOT NULL DEFAULT 'active',  -- 'active' | 'closed' | 'orphaned'
     runner_name      TEXT    NOT NULL DEFAULT 'studio',
+    model            TEXT,                          -- nullable; SDK default if NULL
+    effort           TEXT,                          -- 'low' | 'medium' | 'high' | 'max'; null = SDK default
     created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
     last_activity    TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Phase 5: pending tool-use approvals — survive bridge restart so a button
+-- tap after the restart still resolves through to the runner's SDK callback.
+CREATE TABLE IF NOT EXISTS pending_permissions (
+    tool_use_id      TEXT    PRIMARY KEY,
+    thread_id        INTEGER NOT NULL,
+    message_id       INTEGER NOT NULL,             -- the Telegram message hosting the card
+    tool_name        TEXT    NOT NULL,
+    input_json       TEXT    NOT NULL,
+    created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+    decided_at       TEXT,
+    decision         TEXT,                          -- 'allow' | 'deny' | NULL while waiting
+    FOREIGN KEY (thread_id) REFERENCES sessions(thread_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_permissions_thread ON pending_permissions(thread_id);
+CREATE INDEX IF NOT EXISTS idx_pending_permissions_unresolved
+    ON pending_permissions(decided_at) WHERE decided_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state);
 
@@ -33,4 +53,4 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
-INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '3');
+INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '4');

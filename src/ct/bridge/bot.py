@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -43,29 +44,65 @@ VALID_MODES: tuple[PermissionMode, ...] = (
 )
 
 
-def _parse_new_args(text: str) -> tuple[str, str | None, str | None]:
-    """Parse `/new <name>... [dir=<path>] [mac=<runner>]`. Tokens are split on
-    whitespace; any `key=value` token is consumed as that flag, anything else
-    becomes part of the project name. Args can appear in any order."""
+VALID_EFFORTS = ("low", "medium", "high", "max")
+MODEL_ALIASES = {
+    "opus": "claude-opus-4-7",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+
+
+def _resolve_model(name: str) -> str:
+    """Map common short names to canonical model ids; pass-through otherwise."""
+    return MODEL_ALIASES.get(name, name)
+
+
+@dataclass
+class NewArgs:
+    name: str
+    cwd: str | None
+    mac: str | None
+    model: str | None
+    effort: str | None
+
+
+def _parse_new_args(text: str) -> NewArgs:
+    """Parse `/new <name>... [dir=...] [mac=...] [model=...] [effort=...]`.
+    Tokens are split on whitespace; any `key=value` token is consumed as that
+    flag, anything else becomes part of the project name. Order-independent."""
     tokens = text.strip().split()
     if len(tokens) < 2:
-        raise ValueError("usage: /new <name> [dir=<path>] [mac=<runner>]")
+        raise ValueError(
+            "usage: /new <name> [dir=<path>] [mac=<runner>] "
+            "[model=<opus|sonnet|haiku|...>] [effort=<low|medium|high|max>]"
+        )
 
     name_parts: list[str] = []
     cwd: str | None = None
     mac: str | None = None
-    for token in tokens[1:]:  # skip the '/new'
+    model: str | None = None
+    effort: str | None = None
+    for token in tokens[1:]:
         if token.startswith("dir="):
             cwd = token[len("dir="):]
         elif token.startswith("mac="):
             mac = token[len("mac="):]
+        elif token.startswith("model="):
+            model = _resolve_model(token[len("model="):])
+        elif token.startswith("effort="):
+            effort = token[len("effort="):]
+            if effort not in VALID_EFFORTS:
+                raise ValueError(
+                    f"effort must be one of {', '.join(VALID_EFFORTS)}; got {effort!r}"
+                )
         else:
             name_parts.append(token)
 
     name = " ".join(name_parts)
     if not name:
         raise ValueError("project name can't be empty")
-    return name, cwd or None, mac or None
+    return NewArgs(name=name, cwd=cwd or None, mac=mac or None,
+                   model=model, effort=effort)
 
 
 class BridgeBot:
@@ -134,6 +171,8 @@ class BridgeBot:
         self._router.message.register(self.cmd_permissions, Command("permissions"))
         self._router.message.register(self.cmd_close, Command("close"))
         self._router.message.register(self.cmd_macs, Command("macs"))
+        self._router.message.register(self.cmd_model, Command("model"))
+        self._router.message.register(self.cmd_effort, Command("effort"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
 
         self._router.message.register(
@@ -149,14 +188,18 @@ class BridgeBot:
         await message.answer(
             "Claude → Telegram bridge\n\n"
             "Commands:\n"
-            "  /new <name> [dir=<path>] [mac=<runner>] — start a session in its own topic\n"
+            "  /new <name> [dir=...] [mac=...] [model=...] [effort=...] — start a session\n"
             "  /list — show active sessions\n"
             "  /permissions [mode] — show or change permission mode for this topic\n"
+            "  /model [name] — show or live-swap the model (opus/sonnet/haiku/...)\n"
+            "  /effort [level] — show or set effort (applies on next session)\n"
             "  /close — close this topic's session\n"
-            "  /macs — list registered runners\n"
+            "  /macs [add|remove] — list/manage registered runners\n"
             "  /help — this message\n\n"
             "Just type in a topic to talk to that session's Claude.\n"
-            "Permission modes: " + ", ".join(VALID_MODES)
+            f"Permission modes: {', '.join(VALID_MODES)}\n"
+            f"Effort levels:    {', '.join(VALID_EFFORTS)}\n"
+            f"Model aliases:    {', '.join(MODEL_ALIASES)}"
         )
 
     async def cmd_macs(self, message: Message) -> None:
@@ -258,12 +301,12 @@ class BridgeBot:
         if message.text is None:
             return
         try:
-            name, dir_arg, mac_arg = _parse_new_args(message.text)
+            args = _parse_new_args(message.text)
         except ValueError as exc:
             await message.answer(f"⚠ {exc}")
             return
-        cwd = Path(dir_arg).expanduser() if dir_arg else self.settings.project_root
-        runner_name = mac_arg or self.default_runner
+        cwd = Path(args.cwd).expanduser() if args.cwd else self.settings.project_root
+        runner_name = args.mac or self.default_runner
 
         # Validate runner is registered
         try:
@@ -286,15 +329,13 @@ class BridgeBot:
             return
 
         try:
-            thread_id = await create_topic(self.bot, self.settings.telegram_chat_id, name)
+            thread_id = await create_topic(self.bot, self.settings.telegram_chat_id, args.name)
         except TelegramBadRequest as exc:
             await message.answer(f"⚠ couldn't create topic: {exc!s}")
             return
 
         sid = str(thread_id)
 
-        # Late-binding: handle callbacks need to reference the SessionHandle
-        # that we don't have until open_session returns.
         handle_box: list[SessionHandle] = []
 
         async def perm_handler(req: PermissionRequest) -> None:
@@ -310,11 +351,15 @@ class BridgeBot:
                 sid=sid,
                 cwd=str(cwd),
                 mode="acceptEdits",
+                model=args.model,
+                effort=args.effort,
                 on_permission_request=perm_handler,
                 on_session_id_assigned=self._make_id_persister(thread_id),
             )
         except Exception as exc:
-            log.exception("session.open_failed", name=name, runner=runner_name, cwd=str(cwd))
+            log.exception(
+                "session.open_failed", name=args.name, runner=runner_name, cwd=str(cwd)
+            )
             await self.bot.send_message(
                 chat_id=self.settings.telegram_chat_id,
                 message_thread_id=thread_id,
@@ -326,24 +371,30 @@ class BridgeBot:
         await self.sessions.add(
             TopicSession(
                 thread_id=thread_id,
-                project_name=name,
+                project_name=args.name,
                 cwd=str(cwd),
                 runner=handle,
                 turn_lock=asyncio.Lock(),
                 runner_name=runner_name,
+                model=args.model,
+                effort=args.effort,
             )
         )
+        ready_lines = [
+            "✓ session ready",
+            f"project: {args.name}",
+            f"cwd:     {cwd}",
+            f"runner:  {runner_name}",
+            f"mode:    acceptEdits  (/permissions to change)",
+            f"model:   {args.model or 'SDK default'}  (/model to change)",
+            f"effort:  {args.effort or 'SDK default'}  (/effort to change)",
+            "",
+            "Type a message to start.",
+        ]
         await self.bot.send_message(
             chat_id=self.settings.telegram_chat_id,
             message_thread_id=thread_id,
-            text=(
-                f"✓ session ready\n"
-                f"project: {name}\n"
-                f"cwd:     {cwd}\n"
-                f"runner:  {runner_name}\n"
-                f"mode:    acceptEdits  (use /permissions to change)\n\n"
-                f"Type a message to start."
-            ),
+            text="\n".join(ready_lines),
         )
 
     async def cmd_list(self, message: Message) -> None:
@@ -353,8 +404,13 @@ class BridgeBot:
             return
         lines = ["active sessions:"]
         for s in active:
+            extras: list[str] = [f"runner={s.runner_name}"]
+            if s.model:
+                extras.append(f"model={s.model}")
+            if s.effort:
+                extras.append(f"effort={s.effort}")
             lines.append(
-                f"  • {s.project_name}  (runner={s.runner_name}, cwd={s.cwd})  "
+                f"  • {s.project_name}  ({', '.join(extras)}, cwd={s.cwd})  "
                 f"mode={s.runner.permission_mode}"
             )
         await message.answer("\n".join(lines))
@@ -393,6 +449,69 @@ class BridgeBot:
             f"✓ permission mode → {mode}\n"
             "(applies to the next tool request; any approval already waiting "
             "will resolve under the previous mode)"
+        )
+
+    async def cmd_model(self, message: Message) -> None:
+        if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
+            await message.answer("/model only works inside a session topic")
+            return
+        session = self.sessions.get(message.message_thread_id)
+        if session is None:
+            await message.answer("no session in this topic.")
+            return
+        if message.text is None:
+            return
+        parts = message.text.strip().split(maxsplit=1)
+        if len(parts) == 1:
+            await message.answer(
+                f"current model: {session.model or '(SDK default)'}\n"
+                f"aliases: {', '.join(MODEL_ALIASES)}\n"
+                f"usage: /model <name-or-alias>"
+            )
+            return
+        raw = parts[1].strip()
+        model = _resolve_model(raw)
+        try:
+            await session.runner.set_model(model)
+        except Exception as exc:
+            await message.answer(f"⚠ couldn't change model: {exc!r}")
+            return
+        session.model = model
+        await self.db.update_session_model(session.thread_id, model)
+        await message.answer(f"✓ model → {model} (effective on next turn)")
+
+    async def cmd_effort(self, message: Message) -> None:
+        if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
+            await message.answer("/effort only works inside a session topic")
+            return
+        session = self.sessions.get(message.message_thread_id)
+        if session is None:
+            await message.answer("no session in this topic.")
+            return
+        if message.text is None:
+            return
+        parts = message.text.strip().split(maxsplit=1)
+        if len(parts) == 1:
+            await message.answer(
+                f"current effort: {session.effort or '(SDK default)'}\n"
+                f"levels: {', '.join(VALID_EFFORTS)}\n"
+                f"usage: /effort <level>\n"
+                f"note: takes effect on the *next* session — for the running\n"
+                f"      session, use /close + /new with effort=<level> set."
+            )
+            return
+        level = parts[1].strip()
+        if level not in VALID_EFFORTS:
+            await message.answer(
+                f"⚠ effort must be one of {', '.join(VALID_EFFORTS)}; got {level!r}"
+            )
+            return
+        session.effort = level
+        await self.db.update_session_effort(session.thread_id, level)
+        await message.answer(
+            f"✓ effort → {level}\n"
+            f"saved to DB. takes effect when the session is next opened\n"
+            f"(/close this topic and /new with effort={level} to apply now)."
         )
 
     async def cmd_close(self, message: Message) -> None:
@@ -532,6 +651,8 @@ class BridgeBot:
                 cwd=spec.cwd,
                 mode=spec.permission_mode,  # type: ignore[arg-type]
                 resume=spec.sdk_session_id,
+                model=spec.model,
+                effort=spec.effort,
                 on_permission_request=perm_handler,
                 on_session_id_assigned=self._make_id_persister(spec.thread_id),
             )

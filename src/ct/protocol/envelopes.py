@@ -43,6 +43,7 @@ T_PONG = "pong"               # heartbeat reply
 
 ALL_TYPES: frozenset[str] = frozenset({
     T_OPEN, T_SEND, T_DECIDE, T_SET_MODE, T_INTERRUPT, T_CLOSE, T_PING,
+    "set_model",
     T_OPENED, T_SDK_ID, T_TEXT, T_TOOL_USE, T_TOOL_RESULT, T_THINKING,
     T_SYSTEM, T_PERMISSION_REQUEST, T_TURN_END, T_CLOSED, T_ERROR, T_PONG,
 })
@@ -113,13 +114,27 @@ class ProtocolError(ValueError):
 
 
 def open_payload(*, cwd: str, mode: str, resume: str | None = None,
-                 system_prompt: str | None = None) -> dict[str, Any]:
+                 system_prompt: str | None = None,
+                 model: str | None = None,
+                 effort: str | None = None) -> dict[str, Any]:
     p: dict[str, Any] = {"cwd": cwd, "mode": mode}
     if resume is not None:
         p["resume"] = resume
     if system_prompt is not None:
         p["system_prompt"] = system_prompt
+    if model is not None:
+        p["model"] = model
+    if effort is not None:
+        p["effort"] = effort
     return p
+
+
+# T_SET_MODEL: bridge → runner, change the model live (uses ClaudeSDKClient.set_model)
+T_SET_MODEL = "set_model"
+
+
+def set_model_payload(model: str) -> dict[str, Any]:
+    return {"model": model}
 
 
 def send_payload(text: str) -> dict[str, Any]:

@@ -76,6 +76,8 @@ class SessionRunner:
         on_session_id_assigned: Callable[[str], Awaitable[None]] | None = None,
         resume: str | None = None,
         system_prompt: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
     ) -> None:
         self.cwd = cwd
         self.permission_mode: PermissionMode = permission_mode
@@ -83,6 +85,8 @@ class SessionRunner:
         self.on_session_id_assigned = on_session_id_assigned
         self.resume = resume
         self.system_prompt = system_prompt
+        self.model = model
+        self.effort = effort
 
         # If we're resuming an existing SDK session, the bridge already knows
         # the id — surface it immediately so callers can rely on it before the
@@ -105,7 +109,7 @@ class SessionRunner:
         if self._client is not None:
             raise RuntimeError("SessionRunner already started")
 
-        options = ClaudeAgentOptions(
+        options_kwargs: dict[str, Any] = dict(
             cwd=self.cwd,
             permission_mode=self.permission_mode,
             resume=self.resume,
@@ -124,6 +128,11 @@ class SessionRunner:
                 ]
             },
         )
+        if self.model is not None:
+            options_kwargs["model"] = self.model
+        if self.effort is not None:
+            options_kwargs["effort"] = self.effort
+        options = ClaudeAgentOptions(**options_kwargs)
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()
         log.info("session.connected", cwd=self.cwd, mode=self.permission_mode)
@@ -189,6 +198,15 @@ class SessionRunner:
         await self._client.set_permission_mode(mode)
         self.permission_mode = mode
         log.info("session.permission_mode_changed", session_id=self.session_id, mode=mode)
+
+    async def set_model(self, model: str) -> None:
+        """Switch the model on the running ClaudeSDKClient. Takes effect on
+        the next turn (the SDK applies it on the next assistant message)."""
+        if self._client is None:
+            raise RuntimeError("SessionRunner not started")
+        await self._client.set_model(model)
+        self.model = model
+        log.info("session.model_changed", session_id=self.session_id, model=model)
 
     async def resolve_permission(
         self,

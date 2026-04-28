@@ -32,6 +32,8 @@ class TopicSession:
     runner: SessionHandle
     turn_lock: asyncio.Lock
     runner_name: str = "studio"
+    model: str | None = None
+    effort: str | None = None
 
 
 @dataclass
@@ -42,6 +44,8 @@ class RestoreSpec:
     sdk_session_id: str | None
     permission_mode: PermissionMode
     runner_name: str = "studio"
+    model: str | None = None
+    effort: str | None = None
 
 
 # Bridge supplies this when calling restore(). Given the persisted metadata
@@ -70,6 +74,8 @@ class SessionStore:
             cwd=session.cwd,
             permission_mode=session.runner.permission_mode,
             runner_name=session.runner_name,
+            model=session.model,
+            effort=session.effort,
         )
         self._by_thread[session.thread_id] = session
 
@@ -130,6 +136,8 @@ class SessionStore:
                 sdk_session_id=row.sdk_session_id,
                 permission_mode=row.permission_mode,  # type: ignore[arg-type]
                 runner_name=row.runner_name or default_runner_name,
+                model=row.model,
+                effort=row.effort,
             )
             try:
                 handle = await factory(spec)
@@ -150,6 +158,8 @@ class SessionStore:
                 runner=handle,
                 turn_lock=asyncio.Lock(),
                 runner_name=spec.runner_name,
+                model=spec.model,
+                effort=spec.effort,
             )
             restored += 1
             log.info(

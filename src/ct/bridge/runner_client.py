@@ -85,6 +85,8 @@ class _SessionState:
     on_session_id_assigned: SdkIdHandler | None
     sdk_session_id: str | None = None
     permission_mode: str = "acceptEdits"
+    model: str | None = None
+    effort: str | None = None
     opened: asyncio.Event = None  # type: ignore[assignment]
     closed: asyncio.Event = None  # type: ignore[assignment]
     turn_queue: asyncio.Queue | None = None  # only set during a turn
@@ -169,6 +171,22 @@ class SessionHandle:
             Envelope(T_SET_MODE, self.sid, set_mode_payload(mode))
         )
         self._state.permission_mode = mode
+
+    async def set_model(self, model: str) -> None:
+        """Live model swap on the running ClaudeSDKClient. Effective on the
+        next assistant turn."""
+        await self._conn._send(
+            Envelope("set_model", self.sid, {"model": model})
+        )
+        self._state.model = model
+
+    @property
+    def model(self) -> str | None:
+        return self._state.model
+
+    @property
+    def effort(self) -> str | None:
+        return self._state.effort
 
     async def interrupt(self) -> None:
         await self._conn._send(Envelope(T_INTERRUPT, self.sid, {}))
@@ -359,18 +377,17 @@ class RunnerConnection:
             # Reset opened so a fresh wait() blocks until OPENED arrives.
             state.opened.clear()
             state.open_error = None
+            payload = {
+                "cwd": state.cwd,
+                "mode": state.permission_mode,
+                "resume": state.sdk_session_id,
+            }
+            if state.model is not None:
+                payload["model"] = state.model
+            if state.effort is not None:
+                payload["effort"] = state.effort
             try:
-                await self._send(
-                    Envelope(
-                        "open",
-                        sid,
-                        {
-                            "cwd": state.cwd,
-                            "mode": state.permission_mode,
-                            "resume": state.sdk_session_id,
-                        },
-                    )
-                )
+                await self._send(Envelope("open", sid, payload))
             except Exception:
                 log.exception("runner_client.reopen_send_failed", sid=sid)
                 continue
@@ -451,6 +468,8 @@ class RunnerConnection:
         cwd: str,
         mode: PermissionMode,
         resume: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
         on_permission_request: PermissionHandler | None = None,
         on_session_id_assigned: SdkIdHandler | None = None,
     ) -> SessionHandle:
@@ -463,10 +482,15 @@ class RunnerConnection:
             on_session_id_assigned=on_session_id_assigned,
             permission_mode=mode,
             sdk_session_id=resume,
+            model=model,
+            effort=effort,
         )
         self._sessions[sid] = state
         await self._send(
-            Envelope(T_OPEN, sid, open_payload(cwd=cwd, mode=mode, resume=resume))
+            Envelope(
+                T_OPEN, sid,
+                open_payload(cwd=cwd, mode=mode, resume=resume, model=model, effort=effort),
+            )
         )
         try:
             await asyncio.wait_for(state.opened.wait(), timeout=30.0)

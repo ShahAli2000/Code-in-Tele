@@ -30,6 +30,20 @@ class SessionRow:
     created_at: str
     last_activity: str
     runner_name: str = "studio"
+    model: str | None = None
+    effort: str | None = None
+
+
+@dataclass
+class PendingPermissionRow:
+    tool_use_id: str
+    thread_id: int
+    message_id: int
+    tool_name: str
+    input_json: str
+    created_at: str
+    decided_at: str | None
+    decision: str | None
 
 
 @dataclass
@@ -72,6 +86,12 @@ class Db:
                 "ALTER TABLE sessions ADD COLUMN runner_name TEXT NOT NULL DEFAULT 'studio'"
             )
             log.info("db.migrated", change="sessions.runner_name added")
+        if "model" not in session_cols:
+            await self.conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT")
+            log.info("db.migrated", change="sessions.model added")
+        if "effort" not in session_cols:
+            await self.conn.execute("ALTER TABLE sessions ADD COLUMN effort TEXT")
+            log.info("db.migrated", change="sessions.effort added")
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -94,14 +114,31 @@ class Db:
         cwd: str,
         permission_mode: str,
         runner_name: str = "studio",
+        model: str | None = None,
+        effort: str | None = None,
     ) -> None:
         await self.conn.execute(
             """
             INSERT OR REPLACE INTO sessions(
-                thread_id, project_name, cwd, permission_mode, state, runner_name
-            ) VALUES (?, ?, ?, ?, 'active', ?)
+                thread_id, project_name, cwd, permission_mode, state,
+                runner_name, model, effort
+            ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
             """,
-            (thread_id, project_name, cwd, permission_mode, runner_name),
+            (thread_id, project_name, cwd, permission_mode, runner_name, model, effort),
+        )
+        await self.conn.commit()
+
+    async def update_session_model(self, thread_id: int, model: str | None) -> None:
+        await self.conn.execute(
+            "UPDATE sessions SET model = ?, last_activity = datetime('now') WHERE thread_id = ?",
+            (model, thread_id),
+        )
+        await self.conn.commit()
+
+    async def update_session_effort(self, thread_id: int, effort: str | None) -> None:
+        await self.conn.execute(
+            "UPDATE sessions SET effort = ?, last_activity = datetime('now') WHERE thread_id = ?",
+            (effort, thread_id),
         )
         await self.conn.commit()
 
@@ -144,7 +181,7 @@ class Db:
     async def get_session(self, thread_id: int) -> Optional[SessionRow]:
         async with self.conn.execute(
             "SELECT thread_id, project_name, cwd, sdk_session_id, permission_mode, state, "
-            "created_at, last_activity, runner_name "
+            "created_at, last_activity, runner_name, model, effort "
             "FROM sessions WHERE thread_id = ?",
             (thread_id,),
         ) as cur:
@@ -156,11 +193,57 @@ class Db:
     async def list_active_sessions(self) -> list[SessionRow]:
         async with self.conn.execute(
             "SELECT thread_id, project_name, cwd, sdk_session_id, permission_mode, state, "
-            "created_at, last_activity, runner_name "
+            "created_at, last_activity, runner_name, model, effort "
             "FROM sessions WHERE state = 'active' ORDER BY created_at"
         ) as cur:
             rows = await cur.fetchall()
         return [SessionRow(*r) for r in rows]
+
+    # ---- pending permissions -----------------------------------------------
+
+    async def insert_pending_permission(
+        self,
+        *,
+        tool_use_id: str,
+        thread_id: int,
+        message_id: int,
+        tool_name: str,
+        input_json: str,
+    ) -> None:
+        await self.conn.execute(
+            """
+            INSERT OR REPLACE INTO pending_permissions(
+                tool_use_id, thread_id, message_id, tool_name, input_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (tool_use_id, thread_id, message_id, tool_name, input_json),
+        )
+        await self.conn.commit()
+
+    async def mark_permission_decided(
+        self, tool_use_id: str, decision: str
+    ) -> None:
+        await self.conn.execute(
+            "UPDATE pending_permissions SET decided_at = datetime('now'), decision = ? "
+            "WHERE tool_use_id = ?",
+            (decision, tool_use_id),
+        )
+        await self.conn.commit()
+
+    async def delete_pending_permission(self, tool_use_id: str) -> None:
+        await self.conn.execute(
+            "DELETE FROM pending_permissions WHERE tool_use_id = ?", (tool_use_id,)
+        )
+        await self.conn.commit()
+
+    async def list_undecided_permissions(self) -> list[PendingPermissionRow]:
+        async with self.conn.execute(
+            "SELECT tool_use_id, thread_id, message_id, tool_name, input_json, "
+            "created_at, decided_at, decision "
+            "FROM pending_permissions WHERE decided_at IS NULL ORDER BY created_at"
+        ) as cur:
+            rows = await cur.fetchall()
+        return [PendingPermissionRow(*r) for r in rows]
 
     # ---- macs ---------------------------------------------------------------
 

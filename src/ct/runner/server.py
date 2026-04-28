@@ -242,6 +242,8 @@ class RunnerConnection:
                 await self._handle_decide(env)
             elif env.type == T_SET_MODE:
                 await self._handle_set_mode(env)
+            elif env.type == "set_model":
+                await self._handle_set_model(env)
             elif env.type == T_INTERRUPT:
                 await self._handle_interrupt(env)
             elif env.type == T_CLOSE:
@@ -261,6 +263,8 @@ class RunnerConnection:
         cwd = env.payload.get("cwd")
         mode = env.payload.get("mode", "acceptEdits")
         resume = env.payload.get("resume")
+        model = env.payload.get("model")
+        effort = env.payload.get("effort")
         if not isinstance(cwd, str) or not cwd:
             await self._send_error(env.id, "bad_request", "cwd is required")
             return
@@ -289,6 +293,8 @@ class RunnerConnection:
             cwd=cwd,
             permission_mode=mode,  # type: ignore[arg-type]
             resume=resume,
+            model=model if isinstance(model, str) else None,
+            effort=effort if isinstance(effort, str) else None,
             on_permission_request=perm_handler,
             on_session_id_assigned=id_persister,
         )
@@ -373,6 +379,20 @@ class RunnerConnection:
             await session.runner.set_permission_mode(mode)  # type: ignore[arg-type]
         except Exception as exc:
             await self._send_error(env.id, "set_mode_failed", repr(exc))
+
+    async def _handle_set_model(self, env: Envelope) -> None:
+        session = self.sessions.get(env.id)
+        if session is None or session.runner is None:
+            await self._send_error(env.id, "no_session", "open the session first")
+            return
+        model = env.payload.get("model")
+        if not isinstance(model, str):
+            await self._send_error(env.id, "bad_request", "set_model.model required")
+            return
+        try:
+            await session.runner.set_model(model)
+        except Exception as exc:
+            await self._send_error(env.id, "set_model_failed", repr(exc))
 
     async def _handle_interrupt(self, env: Envelope) -> None:
         session = self.sessions.get(env.id)
