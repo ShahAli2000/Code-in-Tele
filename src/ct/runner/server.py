@@ -360,7 +360,14 @@ def _summarise_session_message(m: Any) -> str | None:
                 if body:
                     parts.append(f"[result: {body[:200]}]")
             elif btype == "thinking":
-                parts.append("[thinking…]")
+                # Include the actual reasoning so the dashboard can show what
+                # Claude was thinking (chat stays quiet via the renderer; this
+                # is the "everything visible on the dashboard" path).
+                think_text = (block.get("thinking") or "").strip()
+                if think_text:
+                    parts.append(f"[thinking] {think_text}")
+                else:
+                    parts.append("[thinking…]")
     text = " ".join(p for p in parts if p).strip()
     if not text:
         return None
