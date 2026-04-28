@@ -23,6 +23,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
+    ErrorEvent,
     ForceReply,
     Message,
     TelegramObject,
@@ -244,6 +245,10 @@ class BridgeBot:
             self._router.message.register(self.on_media_message, media_filter)
 
         self._router.callback_query.register(self.on_callback)
+
+        # Anything a handler raises lands here. Log it + DM the admin so a
+        # silent failure doesn't sit in the log file un-noticed.
+        self._router.errors.register(self.on_handler_error)
 
     # ---- commands -----------------------------------------------------------
 
@@ -1707,6 +1712,35 @@ class BridgeBot:
         except Exception:
             log.exception("session.close_failed", thread_id=session.thread_id)
         await self.sessions.close(session.thread_id)
+
+    # ---- crash notifications ----------------------------------------------
+
+    async def on_handler_error(self, event: ErrorEvent) -> None:
+        """Last-resort handler — logs unhandled exceptions and DMs the admin
+        so failures don't sit silently in the log file."""
+        exc = event.exception
+        update = event.update
+        update_repr = (
+            f"update_id={update.update_id}" if update is not None else "(no update)"
+        )
+        log.exception("dispatcher.handler_error", update=update_repr)
+        if not self.settings.telegram_allowed_user_ids:
+            return
+        admin_id = self.settings.telegram_allowed_user_ids[0]
+        try:
+            # Trim long tracebacks to ~3.5 KB to fit Telegram message limits
+            err_text = f"{type(exc).__name__}: {exc!s}"
+            await self.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"⚠ bot error\n"
+                    f"{update_repr}\n\n"
+                    f"```\n{err_text[:3500]}\n```"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            log.exception("dispatcher.error_notify_failed")
 
     # ---- runner-side callbacks ---------------------------------------------
 

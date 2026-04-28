@@ -13,6 +13,7 @@ installed.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import tempfile
 
@@ -20,37 +21,7 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-# Whisper shells out to `ffmpeg` to decode arbitrary audio formats. Bundled
-# imageio-ffmpeg ships a static binary; prepend its dir to PATH so the
-# subprocess.run(['ffmpeg', ...]) inside whisper finds it without needing
-# system-installed ffmpeg.
-try:
-    import imageio_ffmpeg  # type: ignore[import-not-found]
-
-    _ffmpeg_dir = os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe())
-    if _ffmpeg_dir and _ffmpeg_dir not in os.environ.get("PATH", "").split(os.pathsep):
-        os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-    # imageio's binary is named "ffmpeg-<arch>-v..."; whisper calls just "ffmpeg".
-    # Symlink it into the same dir under the canonical name on first use so the
-    # PATH-based lookup finds it.
-    _imageio_bin = imageio_ffmpeg.get_ffmpeg_exe()
-    _ffmpeg_alias = os.path.join(os.path.dirname(_imageio_bin), "ffmpeg")
-    if not os.path.exists(_ffmpeg_alias):
-        try:
-            os.symlink(_imageio_bin, _ffmpeg_alias)
-        except OSError:
-            pass
-except ImportError:
-    pass
-
-# Apple's MLX-accelerated Whisper. Import lazily so non-arm64 hosts stay
-# happy without it.
-try:
-    import mlx_whisper  # type: ignore[import-not-found]
-    _MLX_AVAILABLE = True
-except ImportError:
-    mlx_whisper = None  # type: ignore[assignment]
-    _MLX_AVAILABLE = False
+_FFMPEG_PATH_PREPARED = False  # only do the PATH setup once
 
 # Default model. Trade-offs:
 #   tiny       ~75 MB  — fastest, OK for one-line voice notes
@@ -61,9 +32,34 @@ DEFAULT_MODEL = "mlx-community/whisper-base-mlx"
 
 
 def is_available() -> bool:
-    """True iff transcription will actually do something. False on platforms
-    where mlx-whisper isn't installed."""
-    return _MLX_AVAILABLE
+    """True iff transcription will actually do something. Cheap to call —
+    just probes whether the dep can be imported, doesn't actually load it."""
+    return importlib.util.find_spec("mlx_whisper") is not None
+
+
+def _prepare_ffmpeg_path() -> None:
+    """Ensure ffmpeg is on PATH for the openai-whisper subprocess shell-out.
+    Idempotent — only runs the imageio_ffmpeg bookkeeping the first time."""
+    global _FFMPEG_PATH_PREPARED
+    if _FFMPEG_PATH_PREPARED:
+        return
+    try:
+        import imageio_ffmpeg  # type: ignore[import-not-found]
+    except ImportError:
+        _FFMPEG_PATH_PREPARED = True
+        return
+    bin_path = imageio_ffmpeg.get_ffmpeg_exe()
+    bin_dir = os.path.dirname(bin_path)
+    if bin_dir and bin_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+    # imageio's binary has a versioned name; whisper expects literal `ffmpeg`.
+    alias = os.path.join(bin_dir, "ffmpeg")
+    if not os.path.exists(alias):
+        try:
+            os.symlink(bin_path, alias)
+        except OSError:
+            pass
+    _FFMPEG_PATH_PREPARED = True
 
 
 async def transcribe_bytes(
@@ -73,14 +69,18 @@ async def transcribe_bytes(
     model: str = DEFAULT_MODEL,
 ) -> str | None:
     """Transcribe an audio clip. Returns the text, or None if transcription
-    isn't available on this host. Raises on hard errors."""
-    if not _MLX_AVAILABLE:
+    isn't available on this host. Raises on hard errors.
+
+    Imports mlx_whisper + sets up ffmpeg PATH lazily on first call so the
+    bridge's startup time isn't dominated by torch/mlx import (~25 s on
+    Apple Silicon). After the first transcription, subsequent ones are fast."""
+    if not is_available():
         log.info("transcribe.unavailable")
         return None
+    _prepare_ffmpeg_path()
+    # Heavy import deferred until first use.
+    import mlx_whisper  # type: ignore[import-not-found]
 
-    # mlx_whisper.transcribe wants a path on disk. Write the bytes to a temp
-    # file, run the model in a worker thread (it's CPU/GPU-bound and sync),
-    # then clean up.
     tmp_path: str | None = None
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
