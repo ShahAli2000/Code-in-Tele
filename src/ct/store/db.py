@@ -324,6 +324,8 @@ class Db:
         "default_model",
         "default_effort",
         "default_permission_mode",
+        "quiet_hours_start",   # HH:MM (24h, local TZ); empty = quiet hours off
+        "quiet_hours_end",     # HH:MM (24h, local TZ)
     )
 
     async def get_default(self, key: str) -> str | None:

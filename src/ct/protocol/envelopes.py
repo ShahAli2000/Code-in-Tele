@@ -44,10 +44,11 @@ T_PONG = "pong"               # heartbeat reply
 ALL_TYPES: frozenset[str] = frozenset({
     T_OPEN, T_SEND, T_DECIDE, T_SET_MODE, T_INTERRUPT, T_CLOSE, T_PING,
     "set_model",
-    "list_dir", "mkdir", "upload", "fork", "get_logs", "export",
+    "list_dir", "mkdir", "upload", "fork", "get_logs", "export", "get_file",
     T_OPENED, T_SDK_ID, T_TEXT, T_TOOL_USE, T_TOOL_RESULT, T_THINKING,
     T_SYSTEM, T_PERMISSION_REQUEST, T_TURN_END, T_CLOSED, T_ERROR, T_PONG,
     "dir_listing", "mkdir_ok", "upload_ok", "fork_ok", "logs", "export_ok",
+    "file",
 })
 
 
@@ -169,6 +170,11 @@ T_LOGS = "logs"                    # runner → bridge: payload {entries: [{role
 T_EXPORT = "export"                # bridge → runner: payload {sdk_session_id, cwd}
 T_EXPORT_OK = "export_ok"          # runner → bridge: payload {markdown}
 
+# /get — bridge asks the runner to read a file off disk and ship the bytes
+# back. Capped at MAX_FILE_BYTES so we never blow Telegram's upload limit.
+T_GET_FILE = "get_file"            # bridge → runner: payload {path}
+T_FILE = "file"                    # runner → bridge: payload {path, content_b64, size}
+
 
 def list_dir_payload(path: str, show_hidden: bool = False) -> dict[str, Any]:
     return {"path": path, "show_hidden": show_hidden}
@@ -221,6 +227,14 @@ def export_payload(*, sdk_session_id: str, cwd: str) -> dict[str, Any]:
 
 def export_ok_payload(markdown: str) -> dict[str, Any]:
     return {"markdown": markdown}
+
+
+def get_file_payload(path: str) -> dict[str, Any]:
+    return {"path": path}
+
+
+def file_payload(*, path: str, content_b64: str, size: int) -> dict[str, Any]:
+    return {"path": path, "content_b64": content_b64, "size": size}
 
 
 def send_payload(text: str) -> dict[str, Any]:

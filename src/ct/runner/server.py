@@ -70,8 +70,10 @@ from ct.protocol.envelopes import (
     T_ERROR,
     T_EXPORT,
     T_EXPORT_OK,
+    T_FILE,
     T_FORK,
     T_FORK_OK,
+    T_GET_FILE,
     T_GET_LOGS,
     T_INTERRUPT,
     T_LIST_DIR,
@@ -98,6 +100,7 @@ from ct.protocol.envelopes import (
     dir_listing_payload,
     error_payload,
     export_ok_payload,
+    file_payload,
     fork_ok_payload,
     logs_payload,
     mkdir_ok_payload,
@@ -396,6 +399,8 @@ class RunnerConnection:
                 await self._handle_get_logs(env)
             elif env.type == T_EXPORT:
                 await self._handle_export(env)
+            elif env.type == T_GET_FILE:
+                await self._handle_get_file(env)
             else:
                 await self._send_error(env.id, "unsupported_type", env.type)
         except Exception as exc:
@@ -638,6 +643,43 @@ class RunnerConnection:
             return
         await self._send(
             Envelope(T_UPLOAD_OK, env.id, upload_ok_payload(str(path), len(data)))
+        )
+
+    # 20 MB matches Telegram's bot upload limit. Anything larger is silently
+    # rejected by Telegram with a confusing error, so we cap here.
+    _MAX_GET_FILE_BYTES = 20 * 1024 * 1024
+
+    async def _handle_get_file(self, env: Envelope) -> None:
+        path_raw = env.payload.get("path")
+        if not isinstance(path_raw, str) or not path_raw:
+            await self._send_error(env.id, "bad_request", "get_file.path required")
+            return
+        path = pathlib.Path(path_raw).expanduser()
+        try:
+            if not path.is_file():
+                await self._send_error(env.id, "not_a_file", str(path))
+                return
+            size = path.stat().st_size
+            if size > self._MAX_GET_FILE_BYTES:
+                await self._send_error(
+                    env.id,
+                    "too_large",
+                    f"{size} bytes exceeds {self._MAX_GET_FILE_BYTES}",
+                )
+                return
+            data = path.read_bytes()
+        except PermissionError as exc:
+            await self._send_error(env.id, "permission_denied", str(exc))
+            return
+        except OSError as exc:
+            await self._send_error(env.id, "io_error", str(exc))
+            return
+        b64 = base64.b64encode(data).decode("ascii")
+        await self._send(
+            Envelope(
+                T_FILE, env.id,
+                file_payload(path=str(path), content_b64=b64, size=len(data)),
+            )
         )
 
     async def _handle_fork(self, env: Envelope) -> None:

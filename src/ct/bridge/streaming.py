@@ -13,6 +13,7 @@ from __future__ import annotations
 import difflib
 import json
 import os
+from collections.abc import Callable
 from typing import Any
 
 import structlog
@@ -102,21 +103,33 @@ def _diff_changed_lines(old: str, new: str) -> tuple[int, int]:
 class TopicRenderer:
     """Renders messages from one SessionRunner.turn() into one Telegram topic."""
 
-    def __init__(self, bot: Bot, chat_id: int, thread_id: int) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        chat_id: int,
+        thread_id: int,
+        *,
+        silent: Callable[[], bool] | None = None,
+    ) -> None:
         self.bot = bot
         self.chat_id = chat_id
         self.thread_id = thread_id
+        # Called per-send so quiet-hours changes take effect mid-turn instead
+        # of being baked into the renderer at construction time.
+        self._silent = silent or (lambda: False)
 
     async def _send(self, text: str) -> None:
         """Send text to the topic, spilling to a document if oversized."""
         if not text.strip():
             return
+        silent = self._silent()
         if len(text) <= MAX_TG_MESSAGE:
             try:
                 await self.bot.send_message(
                     chat_id=self.chat_id,
                     message_thread_id=self.thread_id,
                     text=text,
+                    disable_notification=silent,
                 )
                 return
             except TelegramBadRequest as exc:
@@ -129,6 +142,7 @@ class TopicRenderer:
                 chat_id=self.chat_id,
                 message_thread_id=self.thread_id,
                 text=f"[long output — sent as file] {head}",
+                disable_notification=silent,
             )
             await self.bot.send_document(
                 chat_id=self.chat_id,
@@ -136,6 +150,7 @@ class TopicRenderer:
                 document=BufferedInputFile(
                     text.encode("utf-8", errors="replace"), filename="output.txt"
                 ),
+                disable_notification=silent,
             )
         except TelegramBadRequest as exc:
             log.warning("send_document.failed", error=str(exc))
@@ -173,9 +188,11 @@ class TopicRenderer:
             await self._send(f"🔧 Edit\n\n{path}\n(no textual change)")
             return
         header = f"🔧 Edit  {path}\n+{added}/-{removed} lines"
+        silent = self._silent()
         try:
             await self.bot.send_message(
                 chat_id=self.chat_id, message_thread_id=self.thread_id, text=header,
+                disable_notification=silent,
             )
             await self.bot.send_document(
                 chat_id=self.chat_id,
@@ -184,6 +201,7 @@ class TopicRenderer:
                     diff.encode("utf-8", errors="replace"),
                     filename=f"{os.path.basename(path) or 'edit'}.diff",
                 ),
+                disable_notification=silent,
             )
         except TelegramBadRequest as exc:
             log.warning("send_diff.failed", error=str(exc))
@@ -192,9 +210,11 @@ class TopicRenderer:
         size = len(content)
         lines = content.count("\n") + 1
         header = f"📝 Write  {path}\n{lines} lines, {size} bytes"
+        silent = self._silent()
         try:
             await self.bot.send_message(
                 chat_id=self.chat_id, message_thread_id=self.thread_id, text=header,
+                disable_notification=silent,
             )
             await self.bot.send_document(
                 chat_id=self.chat_id,
@@ -203,6 +223,7 @@ class TopicRenderer:
                     content.encode("utf-8", errors="replace"),
                     filename=os.path.basename(path) or "new-file.txt",
                 ),
+                disable_notification=silent,
             )
         except TelegramBadRequest as exc:
             log.warning("send_write_doc.failed", error=str(exc))

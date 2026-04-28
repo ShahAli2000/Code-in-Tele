@@ -14,7 +14,7 @@ import io
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 from pathlib import Path
 from typing import Any
 
@@ -170,6 +170,11 @@ class BridgeBot:
         self.started_at = datetime.now(timezone.utc)
         self.sessions = SessionStore(db)
         self.permissions_ui = PermissionsUI(bot, db)
+        # In-memory mirror of the meta defaults table. Populated on
+        # restore_sessions() and kept in sync via cmd_quiet / cmd_defaults so
+        # that hot-path checks (e.g. _is_quiet_now on every render) don't hit
+        # SQLite per send.
+        self._defaults_cache: dict[str, str | None] = {}
         # ForceReply tracking — message_id -> {action, ...} for ad-hoc prompts.
         self._pending_replies: dict[int, dict[str, Any]] = {}
         # Per-user pending action — fallback when the user types in General
@@ -232,6 +237,8 @@ class BridgeBot:
         self._router.message.register(self.cmd_restart, Command("restart"))
         self._router.message.register(self.cmd_logs, Command("logs"))
         self._router.message.register(self.cmd_export, Command("export"))
+        self._router.message.register(self.cmd_get, Command("get"))
+        self._router.message.register(self.cmd_quiet, Command("quiet"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
 
         # Single text-message handler. Dispatches:
@@ -280,6 +287,8 @@ class BridgeBot:
             "  /restart             — reconnect SDK to this transcript (unstick)\n"
             "  /logs [N]            — show last N transcript entries (default 15)\n"
             "  /export              — full transcript as a markdown file\n"
+            "  /get <path>          — download a file from this session's runner\n"
+            "  /quiet [HH:MM HH:MM] — silence non-permission pings during a window\n"
             "  /macs [add|remove]   — manage registered runners\n"
             "  /status              — uptime, runners, sessions\n\n"
             "Just type in a topic to talk to Claude.\n"
@@ -797,6 +806,7 @@ class BridgeBot:
                 continue
             v = None if arg_val == "null" else arg_val
             await self.db.set_default(key, v)
+            self._defaults_cache[key] = v
             changes.append(f"  {name} → {v or '(none)'}")
         if not changes:
             await message.answer(
@@ -1007,6 +1017,80 @@ class BridgeBot:
         )
         return thread_id
 
+    # ---- quiet hours ------------------------------------------------------
+
+    @staticmethod
+    def _parse_hhmm(s: str) -> dt_time | None:
+        s = s.strip()
+        if not s or ":" not in s:
+            return None
+        try:
+            h, m = s.split(":", 1)
+            return dt_time(hour=int(h), minute=int(m))
+        except (ValueError, TypeError):
+            return None
+
+    def _is_quiet_now(self) -> bool:
+        """Cheap synchronous check used by TopicRenderer on every send.
+        Reads cached defaults populated from the DB at startup. Returns False
+        if quiet hours aren't configured. Local-time semantics: an `start`
+        later than `end` (e.g. 22:00..08:00) means "overnight"."""
+        start = self._parse_hhmm(self._defaults_cache.get("quiet_hours_start") or "")
+        end = self._parse_hhmm(self._defaults_cache.get("quiet_hours_end") or "")
+        if start is None or end is None:
+            return False
+        now = datetime.now().time()
+        if start <= end:
+            return start <= now < end
+        # Overnight window
+        return now >= start or now < end
+
+    async def cmd_quiet(self, message: Message) -> None:
+        """Show or set quiet hours window. Usage:
+            /quiet                   — show current setting
+            /quiet 22:00 08:00       — set 10pm to 8am (overnight)
+            /quiet off               — disable
+        During quiet hours, non-permission messages are sent silently
+        (Telegram's disable_notification). Permission cards still ping."""
+        text = (message.text or "").strip()
+        parts = text.split()
+        if len(parts) == 1:
+            start = self._defaults_cache.get("quiet_hours_start") or "(unset)"
+            end = self._defaults_cache.get("quiet_hours_end") or "(unset)"
+            active = "active now" if self._is_quiet_now() else "inactive now"
+            await message.answer(
+                f"🌙 quiet hours\n"
+                f"start: {start}\n"
+                f"end:   {end}\n"
+                f"({active})\n\n"
+                f"set:    /quiet 22:00 08:00\n"
+                f"clear:  /quiet off"
+            )
+            return
+        if len(parts) == 2 and parts[1].lower() == "off":
+            await self.db.set_default("quiet_hours_start", None)
+            await self.db.set_default("quiet_hours_end", None)
+            self._defaults_cache["quiet_hours_start"] = None
+            self._defaults_cache["quiet_hours_end"] = None
+            await message.answer("✓ quiet hours disabled")
+            return
+        if len(parts) == 3:
+            start = self._parse_hhmm(parts[1])
+            end = self._parse_hhmm(parts[2])
+            if start is None or end is None:
+                await message.answer("⚠ format: HH:MM HH:MM (e.g. 22:00 08:00)")
+                return
+            await self.db.set_default("quiet_hours_start", parts[1])
+            await self.db.set_default("quiet_hours_end", parts[2])
+            self._defaults_cache["quiet_hours_start"] = parts[1]
+            self._defaults_cache["quiet_hours_end"] = parts[2]
+            await message.answer(f"✓ quiet hours set: {parts[1]} → {parts[2]}")
+            return
+        await message.answer(
+            "usage: /quiet [HH:MM HH:MM | off]\n"
+            "current: /quiet"
+        )
+
     async def cmd_status(self, message: Message) -> None:
         """Snapshot of bot health: uptime, runner connectivity, active sessions."""
         now = datetime.now(timezone.utc)
@@ -1051,6 +1135,42 @@ class BridgeBot:
                 )
 
         await message.answer("\n".join(lines))
+
+    async def cmd_get(self, message: Message) -> None:
+        """Pull a file off the runner and ship it to Telegram as an attachment.
+        Usage: /get <path>. Path is resolved on the session's runner (so a
+        laptop session reads from the laptop's filesystem)."""
+        if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
+            await message.answer("/get only works inside a session topic")
+            return
+        session = self.sessions.get(message.message_thread_id)
+        if session is None:
+            await message.answer("no session in this topic.")
+            return
+        text = (message.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer("usage: /get <path>\n(absolute path, or relative to the session's cwd)")
+            return
+        path_arg = parts[1].strip()
+        # Relative paths resolve against the session's cwd.
+        if not path_arg.startswith("/") and not path_arg.startswith("~"):
+            path_arg = str(Path(session.cwd) / path_arg)
+        await message.answer(f"⏳ fetching {path_arg} from {session.runner_name} …")
+        try:
+            resolved, content = await self.runners.get(session.runner_name).get_file(
+                path_arg
+            )
+        except Exception as exc:
+            log.exception("session.get_file_failed", thread_id=session.thread_id)
+            await message.answer(f"⚠ couldn't fetch: {exc!s}")
+            return
+        from aiogram.types import BufferedInputFile
+        filename = Path(resolved).name or "file"
+        await message.answer_document(
+            BufferedInputFile(content, filename=filename),
+            caption=f"📥 {resolved} ({len(content)} bytes)",
+        )
 
     async def cmd_export(self, message: Message) -> None:
         """Send the full session transcript as a markdown file. Uses the
@@ -1506,7 +1626,10 @@ class BridgeBot:
             prompt += f"\n\nCaption: {caption}"
 
         # Run a turn so Claude responds to the upload
-        renderer = TopicRenderer(self.bot, self.settings.telegram_chat_id, thread_id)
+        renderer = TopicRenderer(
+            self.bot, self.settings.telegram_chat_id, thread_id,
+            silent=self._is_quiet_now,
+        )
         async with session.turn_lock:
             try:
                 async for env in session.runner.turn(prompt):
@@ -1529,7 +1652,10 @@ class BridgeBot:
                 "⚠ no session in this topic — use /new <name> in General to start one."
             )
             return
-        renderer = TopicRenderer(self.bot, self.settings.telegram_chat_id, thread_id)
+        renderer = TopicRenderer(
+            self.bot, self.settings.telegram_chat_id, thread_id,
+            silent=self._is_quiet_now,
+        )
         async with session.turn_lock:
             try:
                 async for env in session.runner.turn(message.text):
@@ -2078,6 +2204,9 @@ class BridgeBot:
     async def restore_sessions(self) -> int:
         """Rehydrate sessions from the DB. For each persisted active session,
         ask the configured runner to open the session with `resume=`."""
+        # Populate the cache once at startup. Anything mutating defaults at
+        # runtime (cmd_quiet, _macs_set_default, etc.) updates this too.
+        self._defaults_cache = await self.db.all_defaults()
 
         async def factory(spec: RestoreSpec) -> SessionHandle:
             handle_box: list[SessionHandle] = []

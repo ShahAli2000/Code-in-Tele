@@ -50,8 +50,10 @@ from ct.protocol.envelopes import (
     T_ERROR,
     T_EXPORT,
     T_EXPORT_OK,
+    T_FILE,
     T_FORK,
     T_FORK_OK,
+    T_GET_FILE,
     T_GET_LOGS,
     T_INTERRUPT,
     T_LIST_DIR,
@@ -75,6 +77,7 @@ from ct.protocol.envelopes import (
     decide_payload,
     export_payload,
     fork_payload,
+    get_file_payload,
     get_logs_payload,
     list_dir_payload,
     mkdir_payload,
@@ -599,6 +602,26 @@ class RunnerConnection:
             if isinstance(role, str) and isinstance(text, str):
                 out.append((role, text))
         return out
+
+    async def get_file(self, path: str) -> tuple[str, bytes]:
+        """Read `path` on the runner. Returns (resolved_path, bytes). Raises
+        on permission/IO errors or if size exceeds the runner-side cap."""
+        env = await self._call_rpc(
+            T_GET_FILE, get_file_payload(path),
+            timeout=60.0,  # large files take a while to base64-encode + ship
+        )
+        if env.type == T_ERROR:
+            raise RuntimeError(
+                f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
+            )
+        b64 = env.payload.get("content_b64")
+        if not isinstance(b64, str):
+            raise RuntimeError("file reply missing content_b64")
+        try:
+            data = base64.b64decode(b64, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise RuntimeError(f"bad b64 in file reply: {exc!s}") from exc
+        return env.payload.get("path", path), data
 
     async def export_transcript(
         self, *, sdk_session_id: str, cwd: str
