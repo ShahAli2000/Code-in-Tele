@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -128,8 +129,9 @@ class BridgeBot:
         for _conn in self.runners._connections.values():  # type: ignore[attr-defined]
             _conn.on_reconnect = self.on_runner_reconnect
         self.default_runner = default_runner
+        self.started_at = datetime.now(timezone.utc)
         self.sessions = SessionStore(db)
-        self.permissions_ui = PermissionsUI(bot)
+        self.permissions_ui = PermissionsUI(bot, db)
         self.dp = Dispatcher()
         self._router = Router()
         self._wire_middleware_and_handlers()
@@ -173,6 +175,7 @@ class BridgeBot:
         self._router.message.register(self.cmd_macs, Command("macs"))
         self._router.message.register(self.cmd_model, Command("model"))
         self._router.message.register(self.cmd_effort, Command("effort"))
+        self._router.message.register(self.cmd_status, Command("status"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
 
         self._router.message.register(
@@ -195,6 +198,7 @@ class BridgeBot:
             "  /effort [level] — show or set effort (applies on next session)\n"
             "  /close — close this topic's session\n"
             "  /macs [add|remove] — list/manage registered runners\n"
+            "  /status — bot uptime + runner connectivity + sessions\n"
             "  /help — this message\n\n"
             "Just type in a topic to talk to that session's Claude.\n"
             f"Permission modes: {', '.join(VALID_MODES)}\n"
@@ -514,6 +518,51 @@ class BridgeBot:
             f"(/close this topic and /new with effort={level} to apply now)."
         )
 
+    async def cmd_status(self, message: Message) -> None:
+        """Snapshot of bot health: uptime, runner connectivity, active sessions."""
+        now = datetime.now(timezone.utc)
+        uptime = now - self.started_at
+        # Format uptime as Hh Mm or Dd Hh Mm
+        total_seconds = int(uptime.total_seconds())
+        days, rem = divmod(total_seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, _ = divmod(rem, 60)
+        if days > 0:
+            uptime_str = f"{days}d {hours}h {minutes}m"
+        elif hours > 0:
+            uptime_str = f"{hours}h {minutes}m"
+        else:
+            uptime_str = f"{minutes}m"
+
+        lines = [
+            "📊 bridge status",
+            f"uptime:   {uptime_str} (since {self.started_at.strftime('%Y-%m-%d %H:%M UTC')})",
+            f"chat_id:  {self.settings.telegram_chat_id}",
+            "",
+            "runners:",
+        ]
+        for name in self.runners.names():
+            conn = self.runners.get(name)
+            state = "✓ connected" if conn.connected else "✗ disconnected"
+            sess_count = len([s for s in self.sessions.all() if s.runner_name == name])
+            lines.append(f"  • {name}  ({conn.host}:{conn.port})  {state}  {sess_count} session(s)")
+
+        active = self.sessions.all()
+        lines.append("")
+        if not active:
+            lines.append("sessions: none active")
+        else:
+            lines.append(f"sessions: {len(active)} active")
+            for s in active:
+                lines.append(
+                    f"  • {s.project_name}  runner={s.runner_name}  "
+                    f"mode={s.runner.permission_mode}"
+                    + (f"  model={s.model}" if s.model else "")
+                    + (f"  effort={s.effort}" if s.effort else "")
+                )
+
+        await message.answer("\n".join(lines))
+
     async def cmd_close(self, message: Message) -> None:
         if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
             await message.answer("/close only works inside a session topic")
@@ -617,6 +666,12 @@ class BridgeBot:
         return persist
 
     # ---- restore-on-boot ----------------------------------------------------
+
+    async def expire_pending_approvals(self) -> int:
+        """Called at boot: any pending permission rows in DB are leftovers
+        from before the restart and the runner-side futures have already
+        denied. Edit the messages to mark them expired."""
+        return await self.permissions_ui.expire_orphans(self.settings.telegram_chat_id)
 
     async def restore_sessions(self) -> int:
         """Rehydrate sessions from the DB. For each persisted active session,

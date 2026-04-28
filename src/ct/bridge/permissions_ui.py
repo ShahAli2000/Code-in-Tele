@@ -6,10 +6,16 @@ data encodes the `tool_use_id`. When the user taps, aiogram fires a
 CallbackQuery handler that this module also owns; the handler looks up which
 runner is waiting on which `tool_use_id` and resolves accordingly.
 
-State (pending approval -> runner + message) lives in memory for Phase 0.
+State lives in two places:
+- in-memory `_pending` for live sessions (the runner still has a future open)
+- `pending_permissions` table for survival across bridge restart, so a bridge
+  reboot doesn't leave dead inline-button cards forever. On boot, the bridge
+  marks any leftover rows as expired and edits the messages to say so.
 """
 
 from __future__ import annotations
+
+import json
 
 import structlog
 from aiogram import Bot
@@ -22,6 +28,7 @@ from aiogram.types import (
 
 from ct.bridge.streaming import _format_input_summary
 from ct.sdk_adapter.adapter import PermissionRequest, SessionRunner
+from ct.store.db import Db
 
 log = structlog.get_logger(__name__)
 
@@ -74,10 +81,12 @@ def _make_keyboard(tool_use_id: str) -> InlineKeyboardMarkup:
 
 class PermissionsUI:
     """Stateful: tracks every approval card the bridge has surfaced so a button
-    tap can find the right SessionRunner and edit the right card."""
+    tap can find the right SessionRunner and edit the right card. Also persists
+    each pending entry to the DB so we can clean up after a bridge restart."""
 
-    def __init__(self, bot: Bot) -> None:
+    def __init__(self, bot: Bot, db: Db) -> None:
         self._bot = bot
+        self._db = db
         # tool_use_id -> (runner, chat_id, message_id, original_text)
         self._pending: dict[str, tuple[SessionRunner, int, int, str]] = {}
 
@@ -112,6 +121,43 @@ class PermissionsUI:
             )
             return
         self._pending[request.tool_use_id] = (runner, chat_id, sent.message_id, text)
+        try:
+            await self._db.insert_pending_permission(
+                tool_use_id=request.tool_use_id,
+                thread_id=thread_id,
+                message_id=sent.message_id,
+                tool_name=request.tool_name,
+                input_json=json.dumps(request.input_data, default=str)[:8000],
+            )
+        except Exception:
+            log.exception("permission_card.persist_failed", tool_use_id=request.tool_use_id)
+
+    async def expire_orphans(self, chat_id: int) -> int:
+        """Called once at bridge boot: any pending rows still in the DB are
+        leftovers from before the restart. The runner-side futures backing
+        them have already resolved-as-deny during disconnect cleanup, so we
+        just edit the messages to remove the buttons and mark a synthetic
+        decision in the DB. Returns the count of rows expired."""
+        rows = await self._db.list_undecided_permissions()
+        for row in rows:
+            try:
+                await self._bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=row.message_id,
+                    text=(
+                        f"🤔 Approval needed\n"
+                        f"🔧 {row.tool_name}\n\n"
+                        f"— ✗ EXPIRED (bridge restarted; ask Claude again if you still want this)"
+                    ),
+                    reply_markup=None,
+                )
+            except TelegramBadRequest:
+                # Message may have been deleted from Telegram; that's ok
+                pass
+            await self._db.mark_permission_decided(row.tool_use_id, "expired")
+        if rows:
+            log.info("permission_card.expired_orphans", count=len(rows))
+        return len(rows)
 
     async def handle_callback(self, query: CallbackQuery) -> bool:
         """Returns True if this CallbackQuery was for a permission button.
@@ -137,6 +183,10 @@ class PermissionsUI:
             await query.answer("already resolved", show_alert=False)
         else:
             await query.answer("approved" if allow else "denied")
+        try:
+            await self._db.delete_pending_permission(tool_use_id)
+        except Exception:
+            log.exception("permission_card.delete_failed", tool_use_id=tool_use_id)
 
         # Replace the card with a finalized version (no buttons).
         marker = "✓ APPROVED" if allow else "✗ DENIED"

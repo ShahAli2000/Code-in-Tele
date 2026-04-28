@@ -120,7 +120,8 @@ async def _run() -> int:
     # Rehydrate active sessions from the DB before polling, so messages that
     # land on an existing topic immediately route to a live runner.
     restored = await bridge.restore_sessions()
-    log.info("bridge.ready", restored_sessions=restored)
+    expired = await bridge.expire_pending_approvals()
+    log.info("bridge.ready", restored_sessions=restored, expired_approvals=expired)
 
     stop_event = asyncio.Event()
 
