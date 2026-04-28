@@ -47,7 +47,7 @@ Built on the [Claude Agent SDK](https://docs.claude.com/en/agent-sdk/overview) a
 ## Quick start
 
 ```bash
-git clone https://github.com/<YOU>/Code-in-Tele.git
+git clone https://github.com/ShahAli2000/Code-in-Tele.git
 cd Code-in-Tele
 cp .env.example .env
 # Fill in TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ALLOWED_USER_IDS,
@@ -119,7 +119,7 @@ Paste the output into `BRIDGE_HMAC_SECRET=` on every host's `.env`.
 ### 7. Install on the always-on host
 
 ```bash
-git clone https://github.com/<YOU>/Code-in-Tele.git
+git clone https://github.com/ShahAli2000/Code-in-Tele.git
 cd Code-in-Tele
 cp .env.example .env
 # Edit .env with the values from steps 1, 3, 4, 6.
@@ -144,7 +144,7 @@ In the supergroup's General topic, type `/new test`. You should see a "session r
 On any other Mac or Linux box on the same tailnet, repeat steps 4–6, then:
 
 ```bash
-git clone https://github.com/<YOU>/Code-in-Tele.git
+git clone https://github.com/ShahAli2000/Code-in-Tele.git
 cd Code-in-Tele
 cp .env.example .env
 # Edit .env. Set CT_RUNNER_HOST to this host's tailnet IP so the
