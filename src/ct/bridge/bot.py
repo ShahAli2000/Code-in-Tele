@@ -21,6 +21,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
+from ct.bridge import menu as menu_ui
 from ct.bridge.permissions_ui import PermissionsUI
 from ct.bridge.runner_client import RunnerPool, SessionHandle
 from ct.bridge.sessions import RestoreSpec, SessionStore, TopicSession
@@ -59,23 +60,26 @@ def _resolve_model(name: str) -> str:
 
 
 @dataclass
-class NewArgs:
+class ParsedArgs:
     name: str
     cwd: str | None
     mac: str | None
     model: str | None
     effort: str | None
+    mode: str | None
 
 
-def _parse_new_args(text: str) -> NewArgs:
-    """Parse `/new <name>... [dir=...] [mac=...] [model=...] [effort=...]`.
-    Tokens are split on whitespace; any `key=value` token is consumed as that
-    flag, anything else becomes part of the project name. Order-independent."""
+def _parse_kv_args(text: str, *, require_name: bool = True) -> ParsedArgs:
+    """Parse `<command> <name>... [dir=...] [mac=...] [model=...] [effort=...]
+    [mode=...]`. Tokens are split on whitespace; any `key=value` token is
+    consumed as that flag, anything else becomes part of the name. Order-
+    independent. Used by /new, /save, /defaults."""
     tokens = text.strip().split()
-    if len(tokens) < 2:
+    if len(tokens) < 2 and require_name:
         raise ValueError(
-            "usage: /new <name> [dir=<path>] [mac=<runner>] "
-            "[model=<opus|sonnet|haiku|...>] [effort=<low|medium|high|max>]"
+            "usage: /<cmd> <name> [dir=<path>] [mac=<runner>] "
+            "[model=<opus|sonnet|haiku|...>] [effort=<low|medium|high|max>] "
+            "[mode=<default|acceptEdits|bypassPermissions|dontAsk|plan>]"
         )
 
     name_parts: list[str] = []
@@ -83,6 +87,7 @@ def _parse_new_args(text: str) -> NewArgs:
     mac: str | None = None
     model: str | None = None
     effort: str | None = None
+    mode: str | None = None
     for token in tokens[1:]:
         if token.startswith("dir="):
             cwd = token[len("dir="):]
@@ -96,14 +101,37 @@ def _parse_new_args(text: str) -> NewArgs:
                 raise ValueError(
                     f"effort must be one of {', '.join(VALID_EFFORTS)}; got {effort!r}"
                 )
+        elif token.startswith("mode="):
+            mode = token[len("mode="):]
+            if mode not in VALID_MODES:
+                raise ValueError(
+                    f"mode must be one of {', '.join(VALID_MODES)}; got {mode!r}"
+                )
         else:
             name_parts.append(token)
 
     name = " ".join(name_parts)
-    if not name:
-        raise ValueError("project name can't be empty")
-    return NewArgs(name=name, cwd=cwd or None, mac=mac or None,
-                   model=model, effort=effort)
+    if require_name and not name:
+        raise ValueError("name can't be empty")
+    return ParsedArgs(
+        name=name, cwd=cwd or None, mac=mac or None,
+        model=model, effort=effort, mode=mode,
+    )
+
+
+# Backward-compat shim so existing call sites (cmd_new) keep working.
+_parse_new_args = _parse_kv_args
+
+
+@dataclass
+class ResolvedSession:
+    """Final settings for a /new after applying explicit args > profile > defaults."""
+    name: str
+    cwd: str
+    runner_name: str
+    model: str | None
+    effort: str | None
+    permission_mode: str
 
 
 class BridgeBot:
@@ -176,6 +204,10 @@ class BridgeBot:
         self._router.message.register(self.cmd_model, Command("model"))
         self._router.message.register(self.cmd_effort, Command("effort"))
         self._router.message.register(self.cmd_status, Command("status"))
+        self._router.message.register(self.cmd_save, Command("save"))
+        self._router.message.register(self.cmd_defaults, Command("defaults"))
+        self._router.message.register(self.cmd_profiles, Command("profiles"))
+        self._router.message.register(self.cmd_menu, Command("menu", "m"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
 
         self._router.message.register(
@@ -190,17 +222,25 @@ class BridgeBot:
     async def cmd_help(self, message: Message) -> None:
         await message.answer(
             "Claude → Telegram bridge\n\n"
-            "Commands:\n"
-            "  /new <name> [dir=...] [mac=...] [model=...] [effort=...] — start a session\n"
-            "  /list — show active sessions\n"
-            "  /permissions [mode] — show or change permission mode for this topic\n"
-            "  /model [name] — show or live-swap the model (opus/sonnet/haiku/...)\n"
-            "  /effort [level] — show or set effort (applies on next session)\n"
-            "  /close — close this topic's session\n"
-            "  /macs [add|remove] — list/manage registered runners\n"
-            "  /status — bot uptime + runner connectivity + sessions\n"
-            "  /help — this message\n\n"
-            "Just type in a topic to talk to that session's Claude.\n"
+            "Quick start:\n"
+            "  /save mb dir=~/Local-Files mac=laptop    — save a profile once\n"
+            "  /new mb                                  — start a session from it\n"
+            "  /m                                       — buttons for the current topic\n"
+            "\nAll commands:\n"
+            "  /new [name] [dir=...] [mac=...] [model=...] [effort=...] [mode=...]\n"
+            "      — no args: profile picker. with name: lookup profile + apply args.\n"
+            "  /save <name> [...]   — save/update a profile\n"
+            "  /profiles            — list saved profiles\n"
+            "  /defaults [...]      — show/set bot-wide defaults\n"
+            "  /menu  (or /m)       — buttons for this topic\n"
+            "  /list                — active sessions\n"
+            "  /permissions [mode]  — change mode (or use /m)\n"
+            "  /model [name]        — live-swap model (or use /m)\n"
+            "  /effort [level]      — set effort (or use /m)\n"
+            "  /close               — close this topic's session\n"
+            "  /macs [add|remove]   — manage registered runners\n"
+            "  /status              — uptime, runners, sessions\n\n"
+            "Just type in a topic to talk to Claude.\n"
             f"Permission modes: {', '.join(VALID_MODES)}\n"
             f"Effort levels:    {', '.join(VALID_EFFORTS)}\n"
             f"Model aliases:    {', '.join(MODEL_ALIASES)}"
@@ -301,16 +341,68 @@ class BridgeBot:
         await self.db.remove_mac(name)
         await message.answer(f"✓ {name} disconnected and removed.")
 
+    async def _resolve_for_new(self, args: ParsedArgs) -> "ResolvedSession":
+        """Apply precedence: explicit args > profile > bot defaults > hard-coded fallback."""
+        profile = await self.db.get_profile(args.name) if args.name else None
+        defaults = await self.db.all_defaults()
+
+        def first(*vals: str | None) -> str | None:
+            for v in vals:
+                if v is not None and v != "":
+                    return v
+            return None
+
+        cwd = first(
+            args.cwd,
+            profile.dir if profile else None,
+        )
+        if cwd is None:
+            cwd = str(self.settings.project_root)
+        runner_name = first(
+            args.mac,
+            profile.runner_name if profile else None,
+            defaults.get("default_runner_name"),
+        ) or self.default_runner
+        model = first(
+            args.model,
+            profile.model if profile else None,
+            defaults.get("default_model"),
+        )
+        effort = first(
+            args.effort,
+            profile.effort if profile else None,
+            defaults.get("default_effort"),
+        )
+        mode = first(
+            args.mode,
+            profile.permission_mode if profile else None,
+            defaults.get("default_permission_mode"),
+        ) or "acceptEdits"
+        return ResolvedSession(
+            name=args.name,
+            cwd=cwd,
+            runner_name=runner_name,
+            model=model,
+            effort=effort,
+            permission_mode=mode,
+        )
+
     async def cmd_new(self, message: Message) -> None:
         if message.text is None:
             return
+        # /new with no args → menu (profile picker), implemented in 6c
+        tokens = message.text.strip().split()
+        if len(tokens) == 1:
+            await self._show_new_menu(message)
+            return
         try:
-            args = _parse_new_args(message.text)
+            args = _parse_kv_args(message.text)
         except ValueError as exc:
             await message.answer(f"⚠ {exc}")
             return
-        cwd = Path(args.cwd).expanduser() if args.cwd else self.settings.project_root
-        runner_name = args.mac or self.default_runner
+        resolved = await self._resolve_for_new(args)
+        cwd = Path(resolved.cwd).expanduser()
+        runner_name = resolved.runner_name
 
         # Validate runner is registered
         try:
@@ -354,9 +446,9 @@ class BridgeBot:
             handle = await self.runners.get(runner_name).open_session(
                 sid=sid,
                 cwd=str(cwd),
-                mode="acceptEdits",
-                model=args.model,
-                effort=args.effort,
+                mode=resolved.permission_mode,  # type: ignore[arg-type]
+                model=resolved.model,
+                effort=resolved.effort,
                 on_permission_request=perm_handler,
                 on_session_id_assigned=self._make_id_persister(thread_id),
             )
@@ -380,8 +472,8 @@ class BridgeBot:
                 runner=handle,
                 turn_lock=asyncio.Lock(),
                 runner_name=runner_name,
-                model=args.model,
-                effort=args.effort,
+                model=resolved.model,
+                effort=resolved.effort,
             )
         )
         ready_lines = [
@@ -389,11 +481,11 @@ class BridgeBot:
             f"project: {args.name}",
             f"cwd:     {cwd}",
             f"runner:  {runner_name}",
-            f"mode:    acceptEdits  (/permissions to change)",
-            f"model:   {args.model or 'SDK default'}  (/model to change)",
-            f"effort:  {args.effort or 'SDK default'}  (/effort to change)",
+            f"mode:    {resolved.permission_mode}",
+            f"model:   {resolved.model or 'SDK default'}",
+            f"effort:  {resolved.effort or 'SDK default'}",
             "",
-            "Type a message to start.",
+            "Type a message to start, or /menu for buttons.",
         ]
         await self.bot.send_message(
             chat_id=self.settings.telegram_chat_id,
@@ -518,6 +610,290 @@ class BridgeBot:
             f"(/close this topic and /new with effort={level} to apply now)."
         )
 
+    async def cmd_save(self, message: Message) -> None:
+        """Save (upsert) a profile. Any field you don't set is null and will
+        fall back to /defaults at /new time."""
+        if message.text is None:
+            return
+        try:
+            args = _parse_kv_args(message.text)
+        except ValueError as exc:
+            await message.answer(f"⚠ {exc}\nusage: /save <name> [dir=...] [mac=...] [model=...] [effort=...] [mode=...]")
+            return
+        await self.db.upsert_profile(
+            name=args.name,
+            dir=args.cwd,
+            runner_name=args.mac,
+            model=args.model,
+            effort=args.effort,
+            permission_mode=args.mode,
+        )
+        # Echo back what got saved
+        fields = [
+            ("dir", args.cwd),
+            ("mac", args.mac),
+            ("model", args.model),
+            ("effort", args.effort),
+            ("mode", args.mode),
+        ]
+        details = "\n".join(
+            f"  {k}: {v}" for k, v in fields if v is not None
+        ) or "  (no fields set — will use /defaults)"
+        await message.answer(
+            f"✓ profile saved: {args.name}\n{details}\n\n"
+            f"start with: /new {args.name}"
+        )
+
+    async def cmd_profiles(self, message: Message) -> None:
+        """Text-based list of profiles. /profiles add ... is /save."""
+        rows = await self.db.list_profiles()
+        if not rows:
+            await message.answer(
+                "no saved profiles.\n"
+                "save one with: /save <name> [dir=...] [mac=...] [model=...] [effort=...] [mode=...]"
+            )
+            return
+        lines = ["saved profiles:"]
+        for r in rows:
+            bits: list[str] = []
+            if r.dir: bits.append(f"dir={r.dir}")
+            if r.runner_name: bits.append(f"mac={r.runner_name}")
+            if r.model: bits.append(f"model={r.model}")
+            if r.effort: bits.append(f"effort={r.effort}")
+            if r.permission_mode: bits.append(f"mode={r.permission_mode}")
+            details = ", ".join(bits) or "(no fields set; uses defaults)"
+            lines.append(f"  • {r.name}  ({details})")
+        lines.append("\nstart one with: /new <name>")
+        await message.answer("\n".join(lines))
+
+    async def cmd_defaults(self, message: Message) -> None:
+        """Show/set bot-wide defaults. Profiles + /new args layer on top."""
+        if message.text is None:
+            return
+        tokens = message.text.strip().split()
+        # /defaults with no args → show
+        if len(tokens) == 1:
+            d = await self.db.all_defaults()
+            lines = [
+                "bot defaults (used when /new and profile don't set a field):",
+                f"  mac:    {d.get('default_runner_name') or '(none → studio)'}",
+                f"  model:  {d.get('default_model') or '(SDK default)'}",
+                f"  effort: {d.get('default_effort') or '(SDK default)'}",
+                f"  mode:   {d.get('default_permission_mode') or 'acceptEdits'}",
+                "",
+                "set with: /defaults [mac=...] [model=...] [effort=...] [mode=...]",
+                "unset:    /defaults model=null  (etc.)",
+            ]
+            await message.answer("\n".join(lines))
+            return
+        # /defaults key=value [...] — try to parse via the same helper
+        try:
+            args = _parse_kv_args(message.text, require_name=False)
+        except ValueError as exc:
+            await message.answer(f"⚠ {exc}")
+            return
+        changes: list[str] = []
+        # Map: arg field → DB key
+        for arg_val, key, name in [
+            (args.mac, "default_runner_name", "mac"),
+            (args.model, "default_model", "model"),
+            (args.effort, "default_effort", "effort"),
+            (args.mode, "default_permission_mode", "mode"),
+        ]:
+            if arg_val is None:
+                continue
+            v = None if arg_val == "null" else arg_val
+            await self.db.set_default(key, v)
+            changes.append(f"  {name} → {v or '(none)'}")
+        if not changes:
+            await message.answer(
+                "⚠ nothing to change. /defaults shows current; pass key=value to set."
+            )
+            return
+        await message.answer("✓ defaults updated:\n" + "\n".join(changes))
+
+    async def cmd_menu(self, message: Message) -> None:
+        """Per-topic action card with inline buttons."""
+        if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
+            await message.answer("/menu only works inside a session topic")
+            return
+        session = self.sessions.get(message.message_thread_id)
+        if session is None:
+            await message.answer(
+                "no session in this topic. use /new in General to start one."
+            )
+            return
+        await menu_ui.render_root(
+            self.bot, self.settings.telegram_chat_id,
+            message.message_thread_id, session,
+        )
+
+    async def _show_new_menu(self, message: Message) -> None:
+        """Profile-picker keyboard. Tap a profile → instant session."""
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        profiles = await self.db.list_profiles()
+        rows: list[list[InlineKeyboardButton]] = []
+        # Two profiles per row
+        for i in range(0, len(profiles), 2):
+            row = []
+            for p in profiles[i : i + 2]:
+                row.append(
+                    InlineKeyboardButton(
+                        text=f"📁 {p.name}",
+                        callback_data=f"ct:n:p:{p.name}",
+                    )
+                )
+            rows.append(row)
+        rows.append(
+            [
+                InlineKeyboardButton(text="ℹ️ defaults", callback_data="ct:n:show_defaults"),
+                InlineKeyboardButton(text="❓ usage", callback_data="ct:n:usage"),
+            ]
+        )
+        if profiles:
+            text = (
+                "🚀 start a new session\n\n"
+                "tap a profile to begin, or type:\n"
+                "  /new <name> [dir=...] [mac=...] [model=...] [effort=...]"
+            )
+        else:
+            text = (
+                "no saved profiles yet.\n\n"
+                "save one with:\n"
+                "  /save mb dir=~/Local-Files mac=laptop model=opus\n\n"
+                "then start with: /new mb"
+            )
+        await message.answer(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    async def _handle_new_menu_callback(self, query: CallbackQuery) -> bool:
+        """Handle ct:n:* callback queries from the /new picker."""
+        data = query.data or ""
+        if not data.startswith("ct:n:"):
+            return False
+        rest = data[len("ct:n:") :]
+        if rest == "show_defaults":
+            d = await self.db.all_defaults()
+            await query.answer(
+                f"defaults — mac:{d.get('default_runner_name') or 'studio'} "
+                f"model:{d.get('default_model') or 'sdk'} "
+                f"effort:{d.get('default_effort') or 'sdk'} "
+                f"mode:{d.get('default_permission_mode') or 'acceptEdits'}",
+                show_alert=True,
+            )
+            return True
+        if rest == "usage":
+            await query.answer(
+                "type: /new <name> [dir=...] [mac=...] [model=...] [effort=...] [mode=...]",
+                show_alert=True,
+            )
+            return True
+        if rest.startswith("p:"):
+            profile_name = rest[len("p:") :]
+            await query.answer(f"starting {profile_name}…")
+            # Synthesise a ParsedArgs and run the create flow
+            await self._create_session_from_profile(query, profile_name)
+            return True
+        return False
+
+    async def _create_session_from_profile(
+        self, query: CallbackQuery, profile_name: str
+    ) -> None:
+        """Run the same session-creation flow as cmd_new but driven by a button."""
+        args = ParsedArgs(
+            name=profile_name, cwd=None, mac=None, model=None, effort=None, mode=None
+        )
+        resolved = await self._resolve_for_new(args)
+        cwd = Path(resolved.cwd).expanduser()
+        runner_name = resolved.runner_name
+
+        try:
+            self.runners.get(runner_name)
+        except KeyError:
+            await self.bot.send_message(
+                chat_id=self.settings.telegram_chat_id,
+                text=f"⚠ {runner_name!r} runner not registered. use /macs add",
+            )
+            return
+
+        if runner_name == self.default_runner and not cwd.is_dir():
+            await self.bot.send_message(
+                chat_id=self.settings.telegram_chat_id,
+                text=f"⚠ profile {profile_name!r}: dir does not exist on {runner_name}: {cwd}",
+            )
+            return
+
+        try:
+            thread_id = await create_topic(
+                self.bot, self.settings.telegram_chat_id, profile_name
+            )
+        except TelegramBadRequest as exc:
+            await self.bot.send_message(
+                chat_id=self.settings.telegram_chat_id,
+                text=f"⚠ couldn't create topic: {exc!s}",
+            )
+            return
+
+        sid = str(thread_id)
+        handle_box: list[SessionHandle] = []
+
+        async def perm_handler(req: PermissionRequest) -> None:
+            await self.permissions_ui.render_card(
+                runner=handle_box[0],
+                chat_id=self.settings.telegram_chat_id,
+                thread_id=thread_id,
+                request=req,
+            )
+
+        try:
+            handle = await self.runners.get(runner_name).open_session(
+                sid=sid,
+                cwd=str(cwd),
+                mode=resolved.permission_mode,  # type: ignore[arg-type]
+                model=resolved.model,
+                effort=resolved.effort,
+                on_permission_request=perm_handler,
+                on_session_id_assigned=self._make_id_persister(thread_id),
+            )
+        except Exception as exc:
+            log.exception("session.open_from_profile_failed", profile=profile_name)
+            await self.bot.send_message(
+                chat_id=self.settings.telegram_chat_id,
+                message_thread_id=thread_id,
+                text=f"⚠ couldn't open session: {exc!s}",
+            )
+            return
+        handle_box.append(handle)
+
+        await self.sessions.add(
+            TopicSession(
+                thread_id=thread_id,
+                project_name=profile_name,
+                cwd=str(cwd),
+                runner=handle,
+                turn_lock=asyncio.Lock(),
+                runner_name=runner_name,
+                model=resolved.model,
+                effort=resolved.effort,
+            )
+        )
+        await self.bot.send_message(
+            chat_id=self.settings.telegram_chat_id,
+            message_thread_id=thread_id,
+            text=(
+                f"✓ session ready (from profile: {profile_name})\n"
+                f"cwd:    {cwd}\n"
+                f"runner: {runner_name}\n"
+                f"mode:   {resolved.permission_mode}\n"
+                f"model:  {resolved.model or '(SDK default)'}\n"
+                f"effort: {resolved.effort or '(SDK default)'}\n\n"
+                f"Type a message to start, or /m for buttons."
+            ),
+        )
+
     async def cmd_status(self, message: Message) -> None:
         """Snapshot of bot health: uptime, runner connectivity, active sessions."""
         now = datetime.now(timezone.utc)
@@ -629,7 +1005,26 @@ class BridgeBot:
     async def on_callback(self, query: CallbackQuery) -> None:
         if await self.permissions_ui.handle_callback(query):
             return
+        if await menu_ui.handle_callback(
+            query,
+            sessions_get=self.sessions.get,
+            db=self.db,
+            bot=self.bot,
+            on_close=self._close_session_via_menu,
+        ):
+            return
+        if await self._handle_new_menu_callback(query):
+            return
         await query.answer()
+
+    async def _close_session_via_menu(self, session: TopicSession) -> None:
+        """Called by the action card's close button."""
+        self.permissions_ui.cancel_pending_for(session.runner)
+        try:
+            await session.runner.close()
+        except Exception:
+            log.exception("session.close_failed", thread_id=session.thread_id)
+        await self.sessions.close(session.thread_id)
 
     # ---- runner-side callbacks ---------------------------------------------
 

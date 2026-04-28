@@ -47,6 +47,18 @@ class PendingPermissionRow:
 
 
 @dataclass
+class ProfileRow:
+    name: str
+    dir: str | None
+    runner_name: str | None
+    model: str | None
+    effort: str | None
+    permission_mode: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass
 class MacRow:
     name: str
     host: str
@@ -244,6 +256,103 @@ class Db:
         ) as cur:
             rows = await cur.fetchall()
         return [PendingPermissionRow(*r) for r in rows]
+
+    # ---- profiles ----------------------------------------------------------
+
+    async def upsert_profile(
+        self,
+        *,
+        name: str,
+        dir: str | None = None,
+        runner_name: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        permission_mode: str | None = None,
+    ) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO profiles(name, dir, runner_name, model, effort, permission_mode)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                dir = excluded.dir,
+                runner_name = excluded.runner_name,
+                model = excluded.model,
+                effort = excluded.effort,
+                permission_mode = excluded.permission_mode,
+                updated_at = datetime('now')
+            """,
+            (name, dir, runner_name, model, effort, permission_mode),
+        )
+        await self.conn.commit()
+
+    async def delete_profile(self, name: str) -> bool:
+        async with self.conn.execute(
+            "DELETE FROM profiles WHERE name = ?", (name,)
+        ) as cur:
+            deleted = cur.rowcount or 0
+        await self.conn.commit()
+        return deleted > 0
+
+    async def get_profile(self, name: str) -> ProfileRow | None:
+        async with self.conn.execute(
+            "SELECT name, dir, runner_name, model, effort, permission_mode, "
+            "created_at, updated_at FROM profiles WHERE name = ?",
+            (name,),
+        ) as cur:
+            row = await cur.fetchone()
+        return ProfileRow(*row) if row else None
+
+    async def list_profiles(self) -> list[ProfileRow]:
+        async with self.conn.execute(
+            "SELECT name, dir, runner_name, model, effort, permission_mode, "
+            "created_at, updated_at FROM profiles ORDER BY name"
+        ) as cur:
+            rows = await cur.fetchall()
+        return [ProfileRow(*r) for r in rows]
+
+    # ---- bot defaults (key/value via meta) ---------------------------------
+
+    DEFAULT_KEYS = (
+        "default_runner_name",
+        "default_model",
+        "default_effort",
+        "default_permission_mode",
+    )
+
+    async def get_default(self, key: str) -> str | None:
+        if key not in self.DEFAULT_KEYS:
+            raise ValueError(f"unknown default key: {key!r}")
+        async with self.conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        v = row[0]
+        return v if v else None
+
+    async def set_default(self, key: str, value: str | None) -> None:
+        if key not in self.DEFAULT_KEYS:
+            raise ValueError(f"unknown default key: {key!r}")
+        if value is None:
+            await self.conn.execute(
+                "INSERT INTO meta(key, value) VALUES (?, '') "
+                "ON CONFLICT(key) DO UPDATE SET value=''",
+                (key,),
+            )
+        else:
+            await self.conn.execute(
+                "INSERT INTO meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+        await self.conn.commit()
+
+    async def all_defaults(self) -> dict[str, str | None]:
+        out: dict[str, str | None] = {}
+        for k in self.DEFAULT_KEYS:
+            out[k] = await self.get_default(k)
+        return out
 
     # ---- macs ---------------------------------------------------------------
 

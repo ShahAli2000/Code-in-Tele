@@ -35,6 +35,19 @@ CREATE INDEX IF NOT EXISTS idx_pending_permissions_thread ON pending_permissions
 CREATE INDEX IF NOT EXISTS idx_pending_permissions_unresolved
     ON pending_permissions(decided_at) WHERE decided_at IS NULL;
 
+-- Phase 6: saved profiles. Hybrid model — only set the fields you want
+-- locked; null fields fall through to bot defaults at /new time.
+CREATE TABLE IF NOT EXISTS profiles (
+    name             TEXT    PRIMARY KEY,
+    dir              TEXT,
+    runner_name      TEXT,
+    model            TEXT,
+    effort           TEXT,
+    permission_mode  TEXT,
+    created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state);
 
 -- Phase 3: registered remote runners. The implicit local "studio" runner is
@@ -53,4 +66,9 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
-INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '4');
+INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '5');
+
+-- Default seeds for bot-wide defaults (used when a profile + /new override
+-- don't specify the field). NULL means SDK default.
+INSERT OR IGNORE INTO meta(key, value) VALUES ('default_runner_name', 'studio');
+INSERT OR IGNORE INTO meta(key, value) VALUES ('default_permission_mode', 'acceptEdits');
