@@ -48,10 +48,14 @@ from ct.protocol.envelopes import (
     T_DECIDE,
     T_DIR_LISTING,
     T_ERROR,
+    T_EXPORT,
+    T_EXPORT_OK,
     T_FORK,
     T_FORK_OK,
+    T_GET_LOGS,
     T_INTERRUPT,
     T_LIST_DIR,
+    T_LOGS,
     T_MKDIR,
     T_MKDIR_OK,
     T_UPLOAD,
@@ -69,7 +73,9 @@ from ct.protocol.envelopes import (
     T_TOOL_USE,
     T_TURN_END,
     decide_payload,
+    export_payload,
     fork_payload,
+    get_logs_payload,
     list_dir_payload,
     mkdir_payload,
     upload_payload,
@@ -566,6 +572,50 @@ class RunnerConnection:
                 f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
             )
         return env.payload.get("path", path), int(env.payload.get("size", len(content)))
+
+    async def get_logs(
+        self, *, sdk_session_id: str, cwd: str, limit: int = 20
+    ) -> list[tuple[str, str]]:
+        """Fetch the last `limit` transcript entries (role, text) for the
+        given SDK session. Read off-disk by the runner via SDK
+        get_session_messages, with slash-command noise filtered out."""
+        env = await self._call_rpc(
+            T_GET_LOGS,
+            get_logs_payload(sdk_session_id=sdk_session_id, cwd=cwd, limit=limit),
+            timeout=15.0,
+        )
+        if env.type == T_ERROR:
+            raise RuntimeError(
+                f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
+            )
+        out: list[tuple[str, str]] = []
+        for entry in env.payload.get("entries", []):
+            if not isinstance(entry, dict):
+                continue
+            role = entry.get("role", "?")
+            text = entry.get("text", "")
+            if isinstance(role, str) and isinstance(text, str):
+                out.append((role, text))
+        return out
+
+    async def export_transcript(
+        self, *, sdk_session_id: str, cwd: str
+    ) -> str:
+        """Fetch the full session transcript pre-rendered as markdown by the
+        runner. Used by /export to produce a `.md` document attachment."""
+        env = await self._call_rpc(
+            T_EXPORT,
+            export_payload(sdk_session_id=sdk_session_id, cwd=cwd),
+            timeout=30.0,
+        )
+        if env.type == T_ERROR:
+            raise RuntimeError(
+                f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
+            )
+        markdown = env.payload.get("markdown", "")
+        if not isinstance(markdown, str):
+            raise RuntimeError("export reply missing markdown")
+        return markdown
 
     async def fork_session(
         self, *, sdk_session_id: str, cwd: str, title: str | None = None

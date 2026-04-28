@@ -10,7 +10,9 @@ the SDK and debounce-edit a single message for the "live transcript" feel.
 
 from __future__ import annotations
 
+import difflib
 import json
+import os
 from typing import Any
 
 import structlog
@@ -23,6 +25,11 @@ log = structlog.get_logger(__name__)
 # Telegram's hard message-size limit is 4096 chars; leave headroom for the
 # "..." truncation marker and any HTML/Markdown framing.
 MAX_TG_MESSAGE = 3800
+
+# When an Edit/Write input (old_string, new_string, or content) exceeds this
+# many chars, render the change as a unified-diff document attachment instead
+# of cramming a truncated inline preview that hides most of the change.
+DIFF_INLINE_LIMIT = 800
 
 
 def _truncate(s: str, n: int = MAX_TG_MESSAGE) -> str:
@@ -55,6 +62,41 @@ def _format_input_summary(tool_name: str, input_data: dict[str, Any]) -> str:
         return json.dumps(input_data, indent=2)[:1000]
     except (TypeError, ValueError):
         return repr(input_data)[:1000]
+
+
+def _build_unified_diff(path: str, old: str, new: str) -> str:
+    """Generate a unified diff for an Edit operation. Same shape as
+    `git diff` so any reader will be at home."""
+    base = os.path.basename(path) or "file"
+    return "".join(
+        difflib.unified_diff(
+            old.splitlines(keepends=True),
+            new.splitlines(keepends=True),
+            fromfile=f"a/{base}",
+            tofile=f"b/{base}",
+            n=3,
+        )
+    )
+
+
+def _diff_changed_lines(old: str, new: str) -> tuple[int, int]:
+    """Approximate (added, removed) line counts for the inline preview header.
+    Cheap — we already split for the diff, so we count opcodes."""
+    old_lines = old.splitlines()
+    new_lines = new.splitlines()
+    added = 0
+    removed = 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+        None, old_lines, new_lines
+    ).get_opcodes():
+        if tag == "replace":
+            removed += i2 - i1
+            added += j2 - j1
+        elif tag == "delete":
+            removed += i2 - i1
+        elif tag == "insert":
+            added += j2 - j1
+    return added, removed
 
 
 class TopicRenderer:
@@ -104,8 +146,66 @@ class TopicRenderer:
         await self._send(text)
 
     async def render_tool_use(self, tool_name: str, input_data: dict[str, Any]) -> None:
+        # Large Edit/Write payloads turn into a unified-diff document attachment
+        # so the user sees the actual change instead of a truncated head/tail.
+        if tool_name == "Edit":
+            old = input_data.get("old_string", "") or ""
+            new = input_data.get("new_string", "") or ""
+            if len(old) > DIFF_INLINE_LIMIT or len(new) > DIFF_INLINE_LIMIT:
+                await self._render_edit_as_diff(
+                    input_data.get("file_path", "") or "file", old, new
+                )
+                return
+        if tool_name == "Write":
+            content = input_data.get("content", "") or ""
+            if len(content) > DIFF_INLINE_LIMIT:
+                await self._render_write_as_document(
+                    input_data.get("file_path", "") or "file", content
+                )
+                return
         summary = _format_input_summary(tool_name, input_data)
         await self._send(f"🔧 {tool_name}\n\n{summary}")
+
+    async def _render_edit_as_diff(self, path: str, old: str, new: str) -> None:
+        added, removed = _diff_changed_lines(old, new)
+        diff = _build_unified_diff(path, old, new)
+        if not diff.strip():
+            await self._send(f"🔧 Edit\n\n{path}\n(no textual change)")
+            return
+        header = f"🔧 Edit  {path}\n+{added}/-{removed} lines"
+        try:
+            await self.bot.send_message(
+                chat_id=self.chat_id, message_thread_id=self.thread_id, text=header,
+            )
+            await self.bot.send_document(
+                chat_id=self.chat_id,
+                message_thread_id=self.thread_id,
+                document=BufferedInputFile(
+                    diff.encode("utf-8", errors="replace"),
+                    filename=f"{os.path.basename(path) or 'edit'}.diff",
+                ),
+            )
+        except TelegramBadRequest as exc:
+            log.warning("send_diff.failed", error=str(exc))
+
+    async def _render_write_as_document(self, path: str, content: str) -> None:
+        size = len(content)
+        lines = content.count("\n") + 1
+        header = f"📝 Write  {path}\n{lines} lines, {size} bytes"
+        try:
+            await self.bot.send_message(
+                chat_id=self.chat_id, message_thread_id=self.thread_id, text=header,
+            )
+            await self.bot.send_document(
+                chat_id=self.chat_id,
+                message_thread_id=self.thread_id,
+                document=BufferedInputFile(
+                    content.encode("utf-8", errors="replace"),
+                    filename=os.path.basename(path) or "new-file.txt",
+                ),
+            )
+        except TelegramBadRequest as exc:
+            log.warning("send_write_doc.failed", error=str(exc))
 
     async def render_tool_result(self, content: Any, is_error: bool) -> None:
         body = content if isinstance(content, str) else repr(content)

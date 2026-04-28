@@ -44,10 +44,10 @@ T_PONG = "pong"               # heartbeat reply
 ALL_TYPES: frozenset[str] = frozenset({
     T_OPEN, T_SEND, T_DECIDE, T_SET_MODE, T_INTERRUPT, T_CLOSE, T_PING,
     "set_model",
-    "list_dir", "mkdir", "upload", "fork",
+    "list_dir", "mkdir", "upload", "fork", "get_logs", "export",
     T_OPENED, T_SDK_ID, T_TEXT, T_TOOL_USE, T_TOOL_RESULT, T_THINKING,
     T_SYSTEM, T_PERMISSION_REQUEST, T_TURN_END, T_CLOSED, T_ERROR, T_PONG,
-    "dir_listing", "mkdir_ok", "upload_ok", "fork_ok",
+    "dir_listing", "mkdir_ok", "upload_ok", "fork_ok", "logs", "export_ok",
 })
 
 
@@ -159,6 +159,16 @@ T_UPLOAD_OK = "upload_ok"          # runner → bridge: payload {path, size}
 T_FORK = "fork"                    # bridge → runner: payload {sdk_session_id, cwd, title?}
 T_FORK_OK = "fork_ok"              # runner → bridge: payload {sdk_session_id}
 
+# /logs — read recent turns from the SDK transcript on disk. Like fork, runs on
+# whichever runner owns the .jsonl file.
+T_GET_LOGS = "get_logs"            # bridge → runner: payload {sdk_session_id, cwd, limit}
+T_LOGS = "logs"                    # runner → bridge: payload {entries: [{role, text}]}
+
+# /export — full markdown transcript, no truncation. Server-side rendering so
+# the bridge doesn't need to know the JSONL message shape.
+T_EXPORT = "export"                # bridge → runner: payload {sdk_session_id, cwd}
+T_EXPORT_OK = "export_ok"          # runner → bridge: payload {markdown}
+
 
 def list_dir_payload(path: str, show_hidden: bool = False) -> dict[str, Any]:
     return {"path": path, "show_hidden": show_hidden}
@@ -194,6 +204,23 @@ def fork_payload(*, sdk_session_id: str, cwd: str,
 
 def fork_ok_payload(sdk_session_id: str) -> dict[str, Any]:
     return {"sdk_session_id": sdk_session_id}
+
+
+def get_logs_payload(*, sdk_session_id: str, cwd: str,
+                     limit: int = 20) -> dict[str, Any]:
+    return {"sdk_session_id": sdk_session_id, "cwd": cwd, "limit": limit}
+
+
+def logs_payload(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"entries": entries}
+
+
+def export_payload(*, sdk_session_id: str, cwd: str) -> dict[str, Any]:
+    return {"sdk_session_id": sdk_session_id, "cwd": cwd}
+
+
+def export_ok_payload(markdown: str) -> dict[str, Any]:
+    return {"markdown": markdown}
 
 
 def send_payload(text: str) -> dict[str, Any]:

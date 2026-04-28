@@ -9,6 +9,7 @@ itself never imports the SDK directly.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import re
 from collections.abc import Awaitable, Callable
@@ -228,6 +229,9 @@ class BridgeBot:
         self._router.message.register(self.cmd_profiles, Command("profiles"))
         self._router.message.register(self.cmd_menu, Command("menu", "m"))
         self._router.message.register(self.cmd_fork, Command("fork"))
+        self._router.message.register(self.cmd_restart, Command("restart"))
+        self._router.message.register(self.cmd_logs, Command("logs"))
+        self._router.message.register(self.cmd_export, Command("export"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
 
         # Single text-message handler. Dispatches:
@@ -273,6 +277,9 @@ class BridgeBot:
             "  /effort [level]      — set effort (or use /m)\n"
             "  /close               — close this topic's session\n"
             "  /fork [name]         — branch this session into a new topic\n"
+            "  /restart             — reconnect SDK to this transcript (unstick)\n"
+            "  /logs [N]            — show last N transcript entries (default 15)\n"
+            "  /export              — full transcript as a markdown file\n"
             "  /macs [add|remove]   — manage registered runners\n"
             "  /status              — uptime, runners, sessions\n\n"
             "Just type in a topic to talk to Claude.\n"
@@ -1045,6 +1052,98 @@ class BridgeBot:
 
         await message.answer("\n".join(lines))
 
+    async def cmd_export(self, message: Message) -> None:
+        """Send the full session transcript as a markdown file. Uses the
+        runner's on-disk .jsonl as source — survives bridge restarts."""
+        if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
+            await message.answer("/export only works inside a session topic")
+            return
+        session = self.sessions.get(message.message_thread_id)
+        if session is None:
+            await message.answer("no session in this topic.")
+            return
+        sdk_id = session.runner.session_id
+        if not sdk_id:
+            await message.answer(
+                "⚠ this session has no transcript yet — send a message first."
+            )
+            return
+        await message.answer("⏳ rendering transcript …")
+        try:
+            md = await self.runners.get(session.runner_name).export_transcript(
+                sdk_session_id=sdk_id, cwd=session.cwd,
+            )
+        except Exception as exc:
+            log.exception("session.export_failed", thread_id=session.thread_id)
+            await message.answer(f"⚠ export failed: {exc!s}")
+            return
+        from aiogram.types import BufferedInputFile
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+        filename = f"{session.project_name}-{ts}.md"
+        await message.answer_document(
+            BufferedInputFile(md.encode("utf-8"), filename=filename),
+            caption=f"📦 transcript export — {session.project_name}",
+        )
+
+    async def cmd_logs(self, message: Message) -> None:
+        """Show the last N transcript entries for this session, read off-disk
+        from the SDK's .jsonl file. Usage: /logs [N] (default 15)."""
+        if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
+            await message.answer("/logs only works inside a session topic")
+            return
+        session = self.sessions.get(message.message_thread_id)
+        if session is None:
+            await message.answer("no session in this topic.")
+            return
+        sdk_id = session.runner.session_id
+        if not sdk_id:
+            await message.answer(
+                "⚠ this session has no transcript yet — send a message first."
+            )
+            return
+
+        # Optional limit arg
+        text = (message.text or "").strip()
+        parts = text.split()
+        limit = 15
+        if len(parts) >= 2:
+            try:
+                limit = max(1, min(int(parts[1]), 100))
+            except ValueError:
+                pass
+
+        try:
+            entries = await self.runners.get(session.runner_name).get_logs(
+                sdk_session_id=sdk_id, cwd=session.cwd, limit=limit,
+            )
+        except Exception as exc:
+            log.exception("session.logs_failed", thread_id=session.thread_id)
+            await message.answer(f"⚠ couldn't fetch logs: {exc!s}")
+            return
+
+        if not entries:
+            await message.answer("(transcript is empty — no surfaced messages yet.)")
+            return
+
+        lines = [f"📜 last {len(entries)} entries:"]
+        for role, text_body in entries:
+            tag = "👤" if role == "user" else "🤖"
+            lines.append(f"\n{tag} {role}\n{text_body}")
+        body = "\n".join(lines)
+
+        # Spill to a document if it's too long for one Telegram message.
+        if len(body) <= 3500:
+            await message.answer(body)
+        else:
+            from aiogram.types import BufferedInputFile
+            await message.answer_document(
+                BufferedInputFile(
+                    body.encode("utf-8"),
+                    filename=f"logs-{session.project_name}.txt",
+                ),
+                caption=f"📜 last {len(entries)} entries (sent as file)",
+            )
+
     async def cmd_fork(self, message: Message) -> None:
         """Branch this topic's session into a new topic with the same transcript
         and settings. Useful for trying a different approach without losing the
@@ -1128,6 +1227,129 @@ class BridgeBot:
                 InlineKeyboardButton(text="✗ cancel", callback_data="ct:cc:no"),
             ]]),
         )
+
+    async def cmd_restart(self, message: Message) -> None:
+        """Reattach the SDK to this topic's transcript. Kills the in-flight
+        turn (if any), tears down the SDK process on the runner, then opens a
+        fresh SDK with resume=<sdk_session_id> so the conversation continues.
+        Useful when a turn is wedged and /interrupt won't recover it."""
+        if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
+            await message.answer("/restart only works inside a session topic")
+            return
+        session = self.sessions.get(message.message_thread_id)
+        if session is None:
+            await message.answer("no session in this topic.")
+            return
+        sdk_id = session.runner.session_id
+        if not sdk_id:
+            await message.answer(
+                "⚠ this session has no sdk_session_id yet — there's nothing "
+                "to restart. send a message first."
+            )
+            return
+
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        await message.answer(
+            f"🔄 restart session {session.project_name!r}?\n\n"
+            f"this will cancel any in-flight turn and reconnect the SDK to "
+            f"the same transcript. use it when /interrupt isn't enough.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="✓ yes, restart",
+                    callback_data=f"ct:rs:yes:{session.thread_id}",
+                ),
+                InlineKeyboardButton(text="✗ cancel", callback_data="ct:rs:no"),
+            ]]),
+        )
+
+    async def _handle_restart_confirm_callback(self, query: CallbackQuery) -> bool:
+        data = query.data or ""
+        if not data.startswith("ct:rs:"):
+            return False
+        rest = data[len("ct:rs:") :]
+        if rest == "no":
+            await menu_ui._safe_edit(
+                self.bot, query, text="✗ restart cancelled", keyboard=None,
+            )
+            await query.answer("cancelled")
+            return True
+        if not rest.startswith("yes:"):
+            await query.answer()
+            return True
+        try:
+            thread_id = int(rest[len("yes:"):])
+        except ValueError:
+            await query.answer("malformed")
+            return True
+        session = self.sessions.get(thread_id)
+        if session is None:
+            await menu_ui._safe_edit(
+                self.bot, query, text="⚠ session no longer exists", keyboard=None,
+            )
+            await query.answer()
+            return True
+        await menu_ui._safe_edit(
+            self.bot, query, text="⏳ restarting session …", keyboard=None,
+        )
+        try:
+            await self._restart_session(session)
+        except Exception as exc:
+            log.exception("session.restart_failed", thread_id=thread_id)
+            await self.bot.send_message(
+                chat_id=self.settings.telegram_chat_id,
+                message_thread_id=thread_id,
+                text=f"⚠ restart failed: {exc!s}",
+            )
+            await query.answer("restart failed")
+            return True
+        await query.answer("restarted")
+        await self.bot.send_message(
+            chat_id=self.settings.telegram_chat_id,
+            message_thread_id=thread_id,
+            text="✓ session restarted — transcript intact, ready for next turn.",
+        )
+        return True
+
+    async def _restart_session(self, session: "TopicSession") -> None:
+        """Tear down the runner-side SDK, then re-open with resume on the same
+        thread_id so the in-memory TopicSession swaps to a fresh handle. The
+        DB row is untouched — sdk_session_id, model, effort, mode all persist."""
+        sdk_id = session.runner.session_id
+        if not sdk_id:
+            raise RuntimeError("session has no sdk_session_id")
+        # Cancel any pending permission card so it doesn't latch on to the
+        # dead handle.
+        self.permissions_ui.cancel_pending_for(session.runner)
+        # Tear down the runner-side session (sends T_CLOSE, awaits CLOSED).
+        with contextlib.suppress(Exception):
+            await session.runner.close()
+
+        # Re-open. perm_handler captures the new handle through the box trick.
+        thread_id = session.thread_id
+        handle_box: list[SessionHandle] = []
+
+        async def perm_handler(req: PermissionRequest) -> None:
+            await self.permissions_ui.render_card(
+                runner=handle_box[0],
+                chat_id=self.settings.telegram_chat_id,
+                thread_id=thread_id,
+                request=req,
+            )
+
+        new_handle = await self.runners.get(session.runner_name).open_session(
+            sid=str(thread_id),
+            cwd=session.cwd,
+            mode=session.runner.permission_mode,  # type: ignore[arg-type]
+            model=session.model,
+            effort=session.effort,
+            resume=sdk_id,
+            on_permission_request=perm_handler,
+            on_session_id_assigned=self._make_id_persister(thread_id),
+        )
+        handle_box.append(new_handle)
+        # Swap the handle on the in-memory record. turn_lock kept — anything
+        # waiting on it will block until this restart completes.
+        session.runner = new_handle
 
     async def _handle_close_confirm_callback(self, query: CallbackQuery) -> bool:
         data = query.data or ""
@@ -1363,6 +1585,8 @@ class BridgeBot:
         if await self._handle_new_menu_callback(query):
             return
         if await self._handle_close_confirm_callback(query):
+            return
+        if await self._handle_restart_confirm_callback(query):
             return
         if await self._handle_macs_remove_callback(query):
             return

@@ -31,6 +31,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import datetime
+import json
 import logging
 import os
 import pathlib
@@ -54,6 +56,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
     fork_session,
+    get_session_messages,
 )
 
 from ct.protocol.auth import frame, unframe
@@ -65,10 +68,14 @@ from ct.protocol.envelopes import (
     T_DECIDE,
     T_DIR_LISTING,
     T_ERROR,
+    T_EXPORT,
+    T_EXPORT_OK,
     T_FORK,
     T_FORK_OK,
+    T_GET_LOGS,
     T_INTERRUPT,
     T_LIST_DIR,
+    T_LOGS,
     T_MKDIR,
     T_MKDIR_OK,
     T_UPLOAD,
@@ -90,7 +97,9 @@ from ct.protocol.envelopes import (
     closed_payload,
     dir_listing_payload,
     error_payload,
+    export_ok_payload,
     fork_ok_payload,
+    logs_payload,
     mkdir_ok_payload,
     upload_ok_payload,
     permission_request_payload,
@@ -164,6 +173,116 @@ def _translate_system(msg: SystemMessage, sid: str) -> Envelope:
         sid,
         system_payload(subtype=msg.subtype or "", data=dict(msg.data or {})),
     )
+
+
+# /logs uses SDK's get_session_messages, which returns SessionMessage objects
+# (different shape from streaming messages — these are dicts loaded from JSONL).
+# We compress each one into a short string for Telegram display.
+_LOG_TEXT_CAP = 600  # per-entry char cap; tool output and long answers truncate
+
+
+def _render_session_message_markdown(m: Any) -> str | None:
+    """Verbose markdown rendering for /export. Unlike the /logs summary,
+    this preserves full text and tool inputs/outputs so the export is a
+    complete record of the conversation."""
+    msg = getattr(m, "message", None)
+    if not isinstance(msg, dict):
+        return None
+    role = m.type
+    role_label = "## 👤 user" if role == "user" else "## 🤖 assistant"
+    content = msg.get("content")
+    blocks: list[str] = []
+    if isinstance(content, str):
+        if content.startswith("<command-name>") or content.startswith("<local-command-"):
+            return None
+        blocks.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text = block.get("text", "")
+                if text:
+                    blocks.append(text)
+            elif btype == "tool_use":
+                name = block.get("name", "?")
+                inp = block.get("input", {})
+                blocks.append(
+                    f"**🔧 tool: `{name}`**\n\n```json\n"
+                    f"{json.dumps(inp, indent=2, ensure_ascii=False, default=str)}\n```"
+                )
+            elif btype == "tool_result":
+                body = block.get("content", "")
+                if isinstance(body, list):
+                    body = "".join(
+                        b.get("text", "") if isinstance(b, dict) else str(b)
+                        for b in body
+                    )
+                body = str(body)
+                if body.strip():
+                    is_error = bool(block.get("is_error"))
+                    label = "tool result (error)" if is_error else "tool result"
+                    blocks.append(f"_{label}:_\n\n```\n{body}\n```")
+            elif btype == "thinking":
+                # Skip — usually internal scratchpad; users export for the conversation.
+                continue
+    body = "\n\n".join(b for b in blocks if b).strip()
+    if not body:
+        return None
+    return f"{role_label}\n\n{body}"
+
+
+def _summarise_session_message(m: Any) -> str | None:
+    """Compress a SessionMessage to a one-string summary for /logs. Returns
+    None for entries that should be hidden (slash-command system noise)."""
+    msg = getattr(m, "message", None)
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    parts: list[str] = []
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                parts.append(block.get("text", ""))
+            elif btype == "tool_use":
+                name = block.get("name", "?")
+                inp = block.get("input", {})
+                summary = ""
+                if isinstance(inp, dict):
+                    if "file_path" in inp:
+                        summary = f" {inp['file_path']}"
+                    elif "command" in inp:
+                        summary = f" {str(inp['command'])[:80]}"
+                    elif "pattern" in inp:
+                        summary = f" {inp['pattern']}"
+                parts.append(f"[🔧 {name}{summary}]")
+            elif btype == "tool_result":
+                body = block.get("content", "")
+                if isinstance(body, list):
+                    body = " ".join(
+                        b.get("text", "") if isinstance(b, dict) else str(b)
+                        for b in body
+                    )
+                body = str(body).strip()
+                if body:
+                    parts.append(f"[result: {body[:200]}]")
+            elif btype == "thinking":
+                parts.append("[thinking…]")
+    text = " ".join(p for p in parts if p).strip()
+    if not text:
+        return None
+    # Hide slash-command bookkeeping entries — these are noise in /logs
+    if text.startswith("<command-name>") or text.startswith("<local-command-"):
+        return None
+    if len(text) > _LOG_TEXT_CAP:
+        text = text[:_LOG_TEXT_CAP] + "…"
+    return text
 
 
 def translate_sdk_message(msg: Any, sid: str) -> list[Envelope]:
@@ -273,6 +392,10 @@ class RunnerConnection:
                 await self._handle_upload(env)
             elif env.type == T_FORK:
                 await self._handle_fork(env)
+            elif env.type == T_GET_LOGS:
+                await self._handle_get_logs(env)
+            elif env.type == T_EXPORT:
+                await self._handle_export(env)
             else:
                 await self._send_error(env.id, "unsupported_type", env.type)
         except Exception as exc:
@@ -547,6 +670,77 @@ class RunnerConnection:
         await self._send(
             Envelope(T_FORK_OK, env.id, fork_ok_payload(result.session_id))
         )
+
+    async def _handle_get_logs(self, env: Envelope) -> None:
+        """Read recent transcript entries via SDK get_session_messages, then
+        compress each into a (role, text) summary so the bridge can render
+        them in a single Telegram message."""
+        sdk_session_id = env.payload.get("sdk_session_id")
+        cwd = env.payload.get("cwd")
+        limit = env.payload.get("limit", 20)
+        if not isinstance(sdk_session_id, str) or not sdk_session_id:
+            await self._send_error(env.id, "bad_request", "get_logs.sdk_session_id required")
+            return
+        if not isinstance(cwd, str) or not cwd:
+            await self._send_error(env.id, "bad_request", "get_logs.cwd required")
+            return
+        if not isinstance(limit, int) or limit <= 0:
+            limit = 20
+        try:
+            msgs = await asyncio.to_thread(
+                get_session_messages, sdk_session_id, directory=cwd, limit=limit
+            )
+        except Exception as exc:
+            log.exception("runner.get_logs_failed", sdk_session_id=sdk_session_id)
+            await self._send_error(env.id, "logs_failed", repr(exc))
+            return
+        entries: list[dict[str, Any]] = []
+        for m in msgs:
+            text = _summarise_session_message(m)
+            if text is None:
+                continue
+            entries.append({"role": m.type, "text": text})
+        await self._send(Envelope(T_LOGS, env.id, logs_payload(entries)))
+
+    async def _handle_export(self, env: Envelope) -> None:
+        """Read the entire transcript and render as a single markdown blob.
+        The bridge attaches it as a `.md` file; full rendering happens here so
+        the wire format stays simple."""
+        sdk_session_id = env.payload.get("sdk_session_id")
+        cwd = env.payload.get("cwd")
+        if not isinstance(sdk_session_id, str) or not sdk_session_id:
+            await self._send_error(env.id, "bad_request", "export.sdk_session_id required")
+            return
+        if not isinstance(cwd, str) or not cwd:
+            await self._send_error(env.id, "bad_request", "export.cwd required")
+            return
+        try:
+            msgs = await asyncio.to_thread(
+                get_session_messages, sdk_session_id, directory=cwd, limit=None
+            )
+        except Exception as exc:
+            log.exception("runner.export_failed", sdk_session_id=sdk_session_id)
+            await self._send_error(env.id, "export_failed", repr(exc))
+            return
+        # Header makes the export self-describing.
+        header_lines = [
+            f"# Claude session transcript",
+            "",
+            f"- session_id: `{sdk_session_id}`",
+            f"- cwd: `{cwd}`",
+            f"- exported: {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
+            f"- messages: {len(msgs)}",
+            "",
+            "---",
+            "",
+        ]
+        body_parts: list[str] = []
+        for m in msgs:
+            rendered = _render_session_message_markdown(m)
+            if rendered:
+                body_parts.append(rendered)
+        markdown = "\n".join(header_lines) + "\n\n---\n\n".join(body_parts) + "\n"
+        await self._send(Envelope(T_EXPORT_OK, env.id, export_ok_payload(markdown)))
 
     async def _handle_close(self, env: Envelope) -> None:
         session = self.sessions.pop(env.id, None)
