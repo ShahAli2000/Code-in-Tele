@@ -20,6 +20,29 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
+# Whisper shells out to `ffmpeg` to decode arbitrary audio formats. Bundled
+# imageio-ffmpeg ships a static binary; prepend its dir to PATH so the
+# subprocess.run(['ffmpeg', ...]) inside whisper finds it without needing
+# system-installed ffmpeg.
+try:
+    import imageio_ffmpeg  # type: ignore[import-not-found]
+
+    _ffmpeg_dir = os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe())
+    if _ffmpeg_dir and _ffmpeg_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+    # imageio's binary is named "ffmpeg-<arch>-v..."; whisper calls just "ffmpeg".
+    # Symlink it into the same dir under the canonical name on first use so the
+    # PATH-based lookup finds it.
+    _imageio_bin = imageio_ffmpeg.get_ffmpeg_exe()
+    _ffmpeg_alias = os.path.join(os.path.dirname(_imageio_bin), "ffmpeg")
+    if not os.path.exists(_ffmpeg_alias):
+        try:
+            os.symlink(_imageio_bin, _ffmpeg_alias)
+        except OSError:
+            pass
+except ImportError:
+    pass
+
 # Apple's MLX-accelerated Whisper. Import lazily so non-arm64 hosts stay
 # happy without it.
 try:
