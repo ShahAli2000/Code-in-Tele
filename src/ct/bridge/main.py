@@ -42,6 +42,8 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="close",       description="Close this topic's session"),
     BotCommand(command="fork",        description="Branch this session into a new topic"),
     BotCommand(command="restart",     description="Reattach SDK to this transcript (unstick)"),
+    BotCommand(command="undo",        description="Reverse last destructive action within 30 min"),
+    BotCommand(command="move",        description="Migrate this session to another mac (mac=NAME)"),
     BotCommand(command="logs",        description="Show last N transcript entries"),
     BotCommand(command="export",      description="Export full transcript as markdown"),
     BotCommand(command="get",         description="Download a file from the runner (/get <path>)"),
@@ -256,6 +258,10 @@ async def _run() -> int:
     # every IDLE_CHECK_INTERVAL_S — separate task so a slow expiry edit
     # doesn't block polling.
     idle_task = bridge.start_idle_check()
+    # Round-trips a T_PING to every connected runner once per
+    # HEALTH_CHECK_INTERVAL_S so /macs can render 🟢/🟡/🔴 instead of relying
+    # on `last_connected` (which goes stale the moment a mac sleeps).
+    health_task = bridge.start_health_check()
 
     await stop_event.wait()
     log.info("bridge.shutting_down")
@@ -265,12 +271,17 @@ async def _run() -> int:
     # safer because it works regardless of the dispatcher's internal state.
     polling_task.cancel()
     idle_task.cancel()
+    health_task.cancel()
     try:
         await polling_task
     except (asyncio.CancelledError, Exception):
         pass
     try:
         await idle_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    try:
+        await health_task
     except (asyncio.CancelledError, Exception):
         pass
 

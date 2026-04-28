@@ -68,6 +68,7 @@ from ct.protocol.envelopes import (
     T_OPEN,
     T_OPENED,
     T_PERMISSION_REQUEST,
+    T_PING,
     T_SDK_ID,
     T_SEND,
     T_SET_MODE,
@@ -266,6 +267,12 @@ class RunnerConnection:
         self._pending_calls: dict[str, asyncio.Future[Envelope]] = {}
         self._send_lock = asyncio.Lock()
         self._auto_reconnect = True
+        # Health-check state. ping() updates these on success; the daemon in
+        # BridgeBot polls every 60s and /macs renders state from these caches.
+        # last_ping_ok_ts is wall-clock so the renderer can compute "Ns ago"
+        # in the same frame as the message; last_ping_ms is the round-trip.
+        self.last_ping_ok_ts: float | None = None
+        self.last_ping_ms: float | None = None
 
     @property
     def url(self) -> str:
@@ -274,6 +281,12 @@ class RunnerConnection:
     @property
     def connected(self) -> bool:
         return self._ws is not None
+
+    def has_session(self, sid: str) -> bool:
+        """True if this runner already has an open session for the given sid.
+        Used as a pre-flight check before /move so we don't read+upload a
+        transcript only to fail at open_session with a 'duplicate' error."""
+        return sid in self._sessions
 
     async def connect(self) -> None:
         if self._ws is not None:
@@ -511,6 +524,24 @@ class RunnerConnection:
         line = frame(env, self.secret)
         async with self._send_lock:
             await self._ws.send(line)
+
+    async def ping(self, *, timeout: float = 5.0) -> float:
+        """Round-trip a T_PING and return the latency in milliseconds. Raises
+        on timeout, transport error, or T_ERROR reply. Updates the cached
+        last_ok_ts/last_ms so the health-check daemon can render mac status."""
+        import time as _time
+        if self._ws is None:
+            raise RuntimeError(f"runner {self.name!r} is not connected")
+        start = _time.monotonic()
+        env = await self._call_rpc(T_PING, {}, timeout=timeout)
+        if env.type == T_ERROR:
+            raise RuntimeError(
+                f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
+            )
+        latency_ms = (_time.monotonic() - start) * 1000.0
+        self.last_ping_ok_ts = _time.time()
+        self.last_ping_ms = latency_ms
+        return latency_ms
 
     # ---- connection-level RPCs (no session) --------------------------------
 

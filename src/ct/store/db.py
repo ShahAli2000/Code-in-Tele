@@ -206,6 +206,17 @@ class Db:
         )
         await self.conn.commit()
 
+    async def update_session_runner_name(
+        self, thread_id: int, runner_name: str
+    ) -> None:
+        """Used by /move when a session migrates to a different mac. Restore
+        on next bridge boot reads runner_name to know where to re-open."""
+        await self.conn.execute(
+            "UPDATE sessions SET runner_name = ?, last_activity = datetime('now') WHERE thread_id = ?",
+            (runner_name, thread_id),
+        )
+        await self.conn.commit()
+
     async def update_sdk_session_id(self, thread_id: int, sdk_session_id: str) -> None:
         await self.conn.execute(
             "UPDATE sessions SET sdk_session_id = ?, last_activity = datetime('now') WHERE thread_id = ?",

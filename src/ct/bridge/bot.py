@@ -204,6 +204,13 @@ class BridgeBot:
         # taps a starting point.
         # Shape: {mac_name, show_hidden, paths: [main_dir, *shortcuts]}
         self._browse_starting_points: dict[int, dict[str, Any]] = {}
+        # Single-step /undo. Holds a snapshot of the most recent destructive
+        # action (close session, delete profile). Overwritten by each new
+        # action — there's no stack. In-memory only; lost on restart, which
+        # matches the safety-net intent ("I just made a mistake," not
+        # "yesterday's mistake"). Shape: {"action": str, "performed_at": float
+        # (monotonic), "payload": dict}.
+        self._last_destructive: dict[str, Any] | None = None
         self.dp = Dispatcher()
         self._router = Router()
         self._wire_middleware_and_handlers()
@@ -255,6 +262,8 @@ class BridgeBot:
         self._router.message.register(self.cmd_menu, Command("menu", "m"))
         self._router.message.register(self.cmd_fork, Command("fork"))
         self._router.message.register(self.cmd_restart, Command("restart"))
+        self._router.message.register(self.cmd_undo, Command("undo"))
+        self._router.message.register(self.cmd_move, Command("move"))
         self._router.message.register(self.cmd_logs, Command("logs"))
         self._router.message.register(self.cmd_export, Command("export"))
         self._router.message.register(self.cmd_get, Command("get"))
@@ -310,6 +319,8 @@ class BridgeBot:
             "  /close               — close this topic's session\n"
             "  /fork [name]         — branch this session into a new topic\n"
             "  /restart             — reconnect SDK to this transcript (unstick)\n"
+            "  /undo                — reverse last destructive action (close, profile delete) within 30 min\n"
+            "  /move mac=NAME       — migrate this session to another runner (transcript preserved)\n"
             "  /logs [N]            — show last N transcript entries (default 15)\n"
             "  /export              — full transcript as a markdown file\n"
             "  /get <path>          — download a file from this session's runner\n"
@@ -451,11 +462,35 @@ class BridgeBot:
         if not names:
             await message.answer("no runners registered.")
             return
+        import time as _time
+        now = _time.time()
         lines = ["registered runners:"]
         for n in names:
             conn = self.runners.get(n)
-            lines.append(f"  • {n}  ({conn.host}:{conn.port})")
+            # Status emoji is set from the health daemon's cached pings rather
+            # than just `conn.connected`, so a runner whose WS is alive but
+            # whose pings are stalling shows up 🟡 instead of falsely 🟢.
+            status = self._mac_status_label(conn, now)
+            lines.append(f"  {status}  {n}  ({conn.host}:{conn.port})")
         await message.answer("\n".join(lines))
+
+    @staticmethod
+    def _mac_status_label(conn, now: float) -> str:
+        """🟢 connected + ping ok ≤90s, 🟡 ping stale or never seen yet,
+        🔴 WS not connected. ⚪ used while the first ping is still in flight
+        right after registration."""
+        if not conn.connected:
+            return "🔴"
+        last = conn.last_ping_ok_ts
+        if last is None:
+            return "⚪"
+        age = now - last
+        if age <= 90:
+            ms = conn.last_ping_ms or 0.0
+            return f"🟢 ({ms:.0f}ms)"
+        if age <= 300:
+            return f"🟡 ({int(age)}s ago)"
+        return f"🔴 (no reply >{int(age)}s)"
 
     async def _macs_add(
         self, message: Message, name: str, host: str, port: int
@@ -1717,6 +1752,301 @@ class BridgeBot:
             ]]),
         )
 
+    # Tunable: how long after a destructive action /undo can still reverse it.
+    # 30 min is long enough to catch "I just made a mistake" while short
+    # enough to avoid acting on stale state.
+    UNDO_TTL_S = 1800
+
+    def _record_destructive(self, action: str, payload: dict[str, Any]) -> None:
+        """Capture the most recent destructive action so /undo can reverse it.
+        Single-slot cache — older entries get overwritten. Keep payloads small
+        and self-contained (no live references to TopicSession etc.)."""
+        import time as _time
+        self._last_destructive = {
+            "action": action,
+            "payload": payload,
+            "performed_at": _time.monotonic(),
+        }
+
+    def _consume_destructive(self) -> dict[str, Any] | None:
+        """Pop the recorded action if it's still within the TTL window. None
+        if nothing's been recorded since boot, or it's older than UNDO_TTL_S."""
+        import time as _time
+        record = self._last_destructive
+        if record is None:
+            return None
+        if _time.monotonic() - record["performed_at"] > self.UNDO_TTL_S:
+            self._last_destructive = None
+            return None
+        self._last_destructive = None
+        return record
+
+    async def cmd_undo(self, message: Message) -> None:
+        """/undo — reverse the most recent destructive action (close session,
+        delete profile) within the last 30 min. Single-step only; no stack."""
+        record = self._consume_destructive()
+        if record is None:
+            await message.answer(
+                "🤷 nothing to undo (or the last action is older than 30 min)."
+            )
+            return
+        action = record["action"]
+        payload = record["payload"]
+        try:
+            if action == "close":
+                await self._undo_close(payload)
+                await message.answer(
+                    f"✓ session {payload['project_name']!r} reopened on "
+                    f"{payload['runner_name']} — transcript intact."
+                )
+            elif action == "profile_delete":
+                await self.db.upsert_profile(
+                    name=payload["name"],
+                    dir=payload.get("dir"),
+                    runner_name=payload.get("runner_name"),
+                    model=payload.get("model"),
+                    effort=payload.get("effort"),
+                    permission_mode=payload.get("permission_mode"),
+                )
+                # system_prompt is a separate write because upsert_profile
+                # doesn't take it (set via the menu's edit flow).
+                if payload.get("system_prompt"):
+                    await self.db.update_profile_system_prompt(
+                        payload["name"], payload["system_prompt"],
+                    )
+                await message.answer(f"✓ profile {payload['name']!r} restored.")
+            else:
+                await message.answer(f"⚠ unknown undoable action: {action!r}")
+        except Exception as exc:
+            log.exception("undo.failed", action=action)
+            await message.answer(f"⚠ undo failed: {exc!s}")
+
+    async def _undo_close(self, payload: dict[str, Any]) -> None:
+        """Reopen a previously-closed session on its original runner with
+        resume=<sdk_session_id>. The DB row was marked closed; flip it to
+        active and re-attach a SessionHandle. The TopicSession dataclass is
+        rebuilt from the snapshot (in-memory state was dropped on close)."""
+        thread_id = payload["thread_id"]
+        sdk_id = payload.get("sdk_session_id")
+        runner_name = payload["runner_name"]
+        # Make sure the runner is still registered and reachable.
+        try:
+            self.runners.get(runner_name)
+        except KeyError as exc:
+            raise RuntimeError(
+                f"runner {runner_name!r} is no longer registered"
+            ) from exc
+
+        handle_box: list[SessionHandle] = []
+
+        async def perm_handler(req: PermissionRequest) -> None:
+            await self.permissions_ui.render_card(
+                runner=handle_box[0],
+                chat_id=self.settings.telegram_chat_id,
+                thread_id=thread_id,
+                request=req,
+            )
+
+        handle = await self.runners.get(runner_name).open_session(
+            sid=str(thread_id),
+            cwd=payload["cwd"],
+            mode=payload["permission_mode"],  # type: ignore[arg-type]
+            model=payload.get("model"),
+            effort=payload.get("effort"),
+            thinking=payload.get("thinking", True),
+            resume=sdk_id,
+            on_permission_request=perm_handler,
+            on_session_id_assigned=self._make_id_persister(thread_id),
+        )
+        handle_box.append(handle)
+        # Re-add to in-memory map + flip the DB row back to active.
+        await self.sessions.add(
+            TopicSession(
+                thread_id=thread_id,
+                project_name=payload["project_name"],
+                cwd=payload["cwd"],
+                runner=handle,
+                turn_lock=asyncio.Lock(),
+                runner_name=runner_name,
+                model=payload.get("model"),
+                effort=payload.get("effort"),
+                thinking=payload.get("thinking", True),
+            )
+        )
+
+    async def cmd_move(self, message: Message) -> None:
+        """/move mac=<dest> — migrate this session to another runner.
+
+        Reads the SDK transcript from the source runner, writes it on the
+        destination, opens a fresh SDK there with resume=<sdk_session_id>,
+        then tears down the source. The conversation continues seamlessly
+        from the user's perspective.
+
+        Caveats:
+        - The cwd must already exist on the destination runner; the bridge
+          can't migrate your project directory.
+        - Files under <cwd>/_uploads/ aren't transferred yet — if Claude
+          referenced an upload, it'll be a dead path on the destination.
+        - Held under turn_lock — if a turn is mid-stream, the move waits.
+        """
+        if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
+            await message.answer("/move only works inside a session topic")
+            return
+        session = self.sessions.get(message.message_thread_id)
+        if session is None:
+            await message.answer("no session in this topic.")
+            return
+
+        parts = (message.text or "").strip().split()
+        dest_name: str | None = None
+        for tok in parts[1:]:
+            if tok.startswith("mac="):
+                dest_name = tok[len("mac="):].strip()
+            elif tok.startswith("dest="):
+                dest_name = tok[len("dest="):].strip()
+        if not dest_name:
+            await message.answer(
+                f"usage: /move mac=<name>\n"
+                f"current: {session.runner_name}\n"
+                f"registered: {', '.join(self.runners.names()) or '(none)'}"
+            )
+            return
+        if dest_name == session.runner_name:
+            await message.answer(f"⚠ session is already on {dest_name!r}.")
+            return
+        try:
+            dest_conn = self.runners.get(dest_name)
+        except KeyError:
+            await message.answer(
+                f"⚠ no runner registered as {dest_name!r}. "
+                f"registered: {', '.join(self.runners.names()) or '(none)'}"
+            )
+            return
+        if not dest_conn.connected:
+            await message.answer(
+                f"⚠ {dest_name!r} is not currently connected — wake it up first."
+            )
+            return
+
+        sdk_id = session.runner.session_id
+        if not sdk_id:
+            await message.answer(
+                "⚠ session has no SDK session id yet — send a message first to "
+                "establish the transcript before /move."
+            )
+            return
+
+        sid = str(session.thread_id)
+        # Pre-flight: bail before any destructive read/write if dest already
+        # has this sid. Almost never hits but a "session already open" error
+        # mid-move would be miserable to debug.
+        if dest_conn.has_session(sid):
+            await message.answer(
+                f"⚠ {dest_name!r} already has a session with sid={sid}. "
+                f"this shouldn't happen — possibly a stale handle from a "
+                f"previous failed /move. try /restart first."
+            )
+            return
+
+        # Hold the turn lock for the whole orchestration so a turn that's
+        # mid-stream completes (or doesn't start) while we shuffle SDKs.
+        async with session.turn_lock:
+            await message.answer(
+                f"⏳ moving session {session.project_name!r} → {dest_name}…"
+            )
+
+            # 1. Read the .jsonl transcript from the source runner.
+            #    The SDK encodes cwd by replacing '/' with '-'; matching path:
+            #    ~/.claude/projects/<encoded-cwd>/<sdk_session_id>.jsonl
+            encoded_cwd = session.cwd.replace("/", "-")
+            transcript_path = f"~/.claude/projects/{encoded_cwd}/{sdk_id}.jsonl"
+            try:
+                _, transcript_bytes = await self.runners.get(
+                    session.runner_name
+                ).get_file(transcript_path)
+            except Exception as exc:
+                await message.answer(
+                    f"⚠ couldn't read source transcript at {transcript_path}: {exc!s}"
+                )
+                return
+
+            # 2. Write it to the destination at the same logical path.
+            try:
+                await dest_conn.upload_file(transcript_path, transcript_bytes)
+            except Exception as exc:
+                await message.answer(
+                    f"⚠ couldn't write transcript to {dest_name!r}: {exc!s}"
+                )
+                return
+
+            # 3. DB-first: flip runner_name on disk before any in-memory or
+            # runner-side change. If everything else fails, restart sees the
+            # session on the dest mac and tries to resume there.
+            try:
+                await self.db.update_session_runner_name(
+                    session.thread_id, dest_name,
+                )
+            except Exception as exc:
+                await message.answer(f"⚠ couldn't persist runner_name change: {exc!s}")
+                return
+
+            # 4. Open a fresh SDK on the destination with resume=. perm_handler
+            # captures the new handle through the box trick so it routes to the
+            # right place once the swap below happens.
+            handle_box: list[SessionHandle] = []
+
+            async def perm_handler(req: PermissionRequest) -> None:
+                await self.permissions_ui.render_card(
+                    runner=handle_box[0],
+                    chat_id=self.settings.telegram_chat_id,
+                    thread_id=session.thread_id,
+                    request=req,
+                )
+
+            try:
+                new_handle = await dest_conn.open_session(
+                    sid=sid,
+                    cwd=session.cwd,
+                    mode=session.runner.permission_mode,  # type: ignore[arg-type]
+                    model=session.model,
+                    effort=session.effort,
+                    thinking=session.thinking,
+                    resume=sdk_id,
+                    on_permission_request=perm_handler,
+                    on_session_id_assigned=self._make_id_persister(session.thread_id),
+                )
+            except Exception as exc:
+                # Source is still alive — undo the DB row update so things
+                # stay consistent.
+                with contextlib.suppress(Exception):
+                    await self.db.update_session_runner_name(
+                        session.thread_id, session.runner_name,
+                    )
+                await message.answer(
+                    f"⚠ /move aborted: dest {dest_name!r} couldn't open: {exc!s}\n"
+                    f"source session is unchanged."
+                )
+                return
+            handle_box.append(new_handle)
+
+            # 5. Swap in-memory + tear down the source SDK. Source close is
+            # best-effort; if it fails the bridge has a leaked SDK process on
+            # the source runner but the user-facing flow is fine.
+            source_name = session.runner_name
+            old_handle = session.runner
+            self.permissions_ui.cancel_pending_for(old_handle)
+            session.runner = new_handle
+            session.runner_name = dest_name
+            with contextlib.suppress(Exception):
+                await old_handle.close()
+
+        await message.answer(
+            f"✓ moved {session.project_name!r} → {dest_name!r}.\n"
+            f"transcript intact via resume=. send a message to continue.\n\n"
+            f"💡 files under {session.cwd}/_uploads/ on {source_name!r} "
+            f"weren't transferred — rsync them manually if Claude needs to re-read them."
+        )
+
     async def cmd_restart(self, message: Message) -> None:
         """Reattach the SDK to this topic's transcript. Kills the in-flight
         turn (if any), tears down the SDK process on the runner, then opens a
@@ -2135,7 +2465,10 @@ class BridgeBot:
             runner_names_fn=self.runners.names,
         ):
             return
-        if await menu_ui.handle_profiles_callback(query, db=self.db, bot=self.bot):
+        if await menu_ui.handle_profiles_callback(
+            query, db=self.db, bot=self.bot,
+            on_destructive=self._record_destructive,
+        ):
             return
         if await self._handle_profile_setprompt_callback(query):
             return
@@ -2696,7 +3029,22 @@ class BridgeBot:
         self._browse_state[sent.message_id] = state
 
     async def _close_session_via_menu(self, session: TopicSession) -> None:
-        """Called by the action card's close button."""
+        """Called by the action card's close button. Snapshots the session
+        first so /undo can re-open it within the TTL window."""
+        # Capture before tearing anything down — once close() runs, runner.close
+        # nulls session_id and the in-memory state goes away. We only need
+        # enough to call open_session(...) again with resume=.
+        self._record_destructive("close", {
+            "thread_id": session.thread_id,
+            "project_name": session.project_name,
+            "cwd": session.cwd,
+            "runner_name": session.runner_name,
+            "model": session.model,
+            "effort": session.effort,
+            "thinking": session.thinking,
+            "permission_mode": session.runner.permission_mode,
+            "sdk_session_id": session.runner.session_id,
+        })
         self.permissions_ui.cancel_pending_for(session.runner)
         try:
             await session.runner.close()
@@ -2862,6 +3210,41 @@ class BridgeBot:
         """Called by main.py after polling starts. Returned task is cancelled
         on shutdown so the bridge exits cleanly."""
         return asyncio.create_task(self._idle_check_loop(), name="bridge-idle-check")
+
+    # Tunables: how often to round-trip every connected runner. Light enough
+    # not to interfere with real traffic; tight enough that an unresponsive
+    # runner shows up red within a couple of minutes.
+    HEALTH_CHECK_INTERVAL_S = 60
+    HEALTH_CHECK_TIMEOUT_S = 5.0
+
+    async def _health_check_loop(self) -> None:
+        """Background task — ping every registered runner once per
+        HEALTH_CHECK_INTERVAL_S. Failures are caught and logged, leaving the
+        runner's last_ping_ok_ts stale (which /macs renders as 🟡 or 🔴)."""
+        while True:
+            try:
+                await asyncio.sleep(self.HEALTH_CHECK_INTERVAL_S)
+            except asyncio.CancelledError:
+                return
+            for name in self.runners.names():
+                conn = self.runners.get(name)
+                if not conn.connected:
+                    # Reconnect logic owns this case; nothing to ping.
+                    continue
+                try:
+                    await conn.ping(timeout=self.HEALTH_CHECK_TIMEOUT_S)
+                except Exception as exc:
+                    log.warning(
+                        "health_check.ping_failed",
+                        name=name, error=str(exc),
+                    )
+
+    def start_health_check(self) -> asyncio.Task:
+        """Same lifecycle pattern as start_idle_check — main.py owns the task
+        and cancels it on shutdown."""
+        return asyncio.create_task(
+            self._health_check_loop(), name="bridge-health-check"
+        )
 
     async def shutdown(self) -> None:
         for s in self.sessions.all():

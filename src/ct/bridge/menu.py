@@ -514,7 +514,10 @@ async def render_profiles(bot: Bot, chat_id: int, db) -> None:
     )
 
 
-async def handle_profiles_callback(query: CallbackQuery, *, db, bot: Bot) -> bool:
+async def handle_profiles_callback(
+    query: CallbackQuery, *, db, bot: Bot,
+    on_destructive=None,  # callable(action: str, payload: dict) -> None
+) -> bool:
     data = query.data or ""
     if not data.startswith(PROFILES_PREFIX):
         return False
@@ -573,6 +576,22 @@ async def handle_profiles_callback(query: CallbackQuery, *, db, bot: Bot) -> boo
         return True
     if verb == "rm_yes" and len(parts) >= 2:
         name = parts[1]
+        # Snapshot the row first so the bridge's /undo can restore it within
+        # the TTL window. on_destructive is injected from BridgeBot; if a
+        # caller doesn't set it (rare — only direct test harnesses), we
+        # silently skip the snapshot rather than fail the delete.
+        if on_destructive is not None:
+            row = await db.get_profile(name)
+            if row is not None:
+                on_destructive("profile_delete", {
+                    "name": row.name,
+                    "dir": row.dir,
+                    "runner_name": row.runner_name,
+                    "model": row.model,
+                    "effort": row.effort,
+                    "permission_mode": row.permission_mode,
+                    "system_prompt": row.system_prompt,
+                })
         ok = await db.delete_profile(name)
         profiles = await db.list_profiles()
         await _safe_edit(
