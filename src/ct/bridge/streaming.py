@@ -1,18 +1,32 @@
-"""Render Claude messages into Telegram messages.
+"""Quiet TopicRenderer — minimal Telegram chat noise, full detail on the dashboard.
 
-Phase 0 MVP — no partial-message editing. Each AssistantMessage's text becomes
-one Telegram message; tool_use blocks and tool results are separate messages so
-the user sees the cadence of "Claude said X → tool → result → Claude said Y".
+Per-turn lifecycle:
+1. `start()` kicks off a heartbeat task. After 5s of silence the task posts
+   "working…"; every 2 min it edits the message with the elapsed minute count;
+   from the 10-min mark it appends the currently-running tool (when known).
+2. `render_text` / `render_tool_use` / `render_tool_result` / `render_thinking`
+   are buffer-only — nothing reaches Telegram during the turn. Tool-use and
+   tool-result envelopes still get logged to `message_log` by the dispatcher,
+   so the web dashboard sees the full transcript.
+3. `finish()` cancels the heartbeat, deletes the "working…" message (or edits
+   it to "✓ done" if delete fails), and sends the final assistant text as a
+   fresh Telegram message — fresh-message semantics so the user gets a
+   notification on the answer (edits often skip notifications).
+4. `render_error` cancels the heartbeat and surfaces the error fresh; the
+   subsequent `finish()` is a no-op.
 
-Phase 0+ refinement (deferred) will enable `include_partial_messages=True` on
-the SDK and debounce-edit a single message for the "live transcript" feel.
+The "final answer" is the assistant text that arrives AFTER the last
+`tool_result`. Earlier text blocks (the "I'll check the file" interludes) are
+discarded, since they're noise without the tool output that follows.
+
+Approval cards live outside this file — `permissions_ui.py` posts them
+immediately while the heartbeat is still ticking.
 """
 
 from __future__ import annotations
 
-import difflib
-import json
-import os
+import asyncio
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -27,81 +41,19 @@ log = structlog.get_logger(__name__)
 # "..." truncation marker and any HTML/Markdown framing.
 MAX_TG_MESSAGE = 3800
 
-# When an Edit/Write input (old_string, new_string, or content) exceeds this
-# many chars, render the change as a unified-diff document attachment instead
-# of cramming a truncated inline preview that hides most of the change.
-DIFF_INLINE_LIMIT = 800
-
-
-def _truncate(s: str, n: int = MAX_TG_MESSAGE) -> str:
-    if len(s) <= n:
-        return s
-    return s[: n - 30] + "\n…[truncated]"
-
-
-def _format_input_summary(tool_name: str, input_data: dict[str, Any]) -> str:
-    """Compact, scannable summary of tool input for chat messages."""
-    if tool_name == "Bash":
-        cmd = input_data.get("command", "")
-        desc = input_data.get("description", "")
-        out = f"$ {cmd}"
-        if desc:
-            out += f"\n# {desc}"
-        return out[:1200]
-    if tool_name in ("Edit", "Write"):
-        path = input_data.get("file_path", "")
-        if tool_name == "Edit":
-            old = (input_data.get("old_string", "") or "")[:300]
-            new = (input_data.get("new_string", "") or "")[:300]
-            return f"{path}\n--- old ---\n{old}\n--- new ---\n{new}"
-        else:
-            content = (input_data.get("content", "") or "")[:600]
-            return f"{path}\n--- new file ---\n{content}"
-    if tool_name == "Read":
-        return input_data.get("file_path", "")
-    try:
-        return json.dumps(input_data, indent=2)[:1000]
-    except (TypeError, ValueError):
-        return repr(input_data)[:1000]
-
-
-def _build_unified_diff(path: str, old: str, new: str) -> str:
-    """Generate a unified diff for an Edit operation. Same shape as
-    `git diff` so any reader will be at home."""
-    base = os.path.basename(path) or "file"
-    return "".join(
-        difflib.unified_diff(
-            old.splitlines(keepends=True),
-            new.splitlines(keepends=True),
-            fromfile=f"a/{base}",
-            tofile=f"b/{base}",
-            n=3,
-        )
-    )
-
-
-def _diff_changed_lines(old: str, new: str) -> tuple[int, int]:
-    """Approximate (added, removed) line counts for the inline preview header.
-    Cheap — we already split for the diff, so we count opcodes."""
-    old_lines = old.splitlines()
-    new_lines = new.splitlines()
-    added = 0
-    removed = 0
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
-        None, old_lines, new_lines
-    ).get_opcodes():
-        if tag == "replace":
-            removed += i2 - i1
-            added += j2 - j1
-        elif tag == "delete":
-            removed += i2 - i1
-        elif tag == "insert":
-            added += j2 - j1
-    return added, removed
+# Time before the first heartbeat appears. Short turns finish before this and
+# the user sees just the answer — no clutter.
+HEARTBEAT_FIRST_DELAY_S = 5.0
+# Cadence for subsequent heartbeat edits.
+HEARTBEAT_INTERVAL_S = 120.0
+# After this many seconds, append the running tool name to the heartbeat so
+# the user has a hint why a turn is taking long.
+HEARTBEAT_TOOL_HINT_AFTER_S = 600.0
 
 
 class TopicRenderer:
-    """Renders messages from one SessionRunner.turn() into one Telegram topic."""
+    """One renderer per turn per topic. Don't reuse across turns — `start()`
+    spawns a task that owns the heartbeat lifecycle for exactly one turn."""
 
     def __init__(
         self,
@@ -117,11 +69,160 @@ class TopicRenderer:
         # Called per-send so quiet-hours changes take effect mid-turn instead
         # of being baked into the renderer at construction time.
         self._silent = silent or (lambda: False)
+        self._started_at: float | None = None
+        self._heartbeat_task: asyncio.Task | None = None
+        self._heartbeat_msg_id: int | None = None
+        # Buffer of assistant text seen since the last tool_result. Only this
+        # buffer's join-output reaches Telegram on `finish()`.
+        self._post_tool_texts: list[str] = []
+        self._current_tool: str | None = None
+        self._errored = False
+        self._finished = False
 
-    async def _send(self, text: str) -> None:
-        """Send text to the topic, spilling to a document if oversized."""
-        if not text.strip():
+    # ---- lifecycle ----------------------------------------------------------
+
+    def start(self) -> None:
+        """Begin the turn. Spawns the heartbeat task; idempotent."""
+        if self._started_at is not None:
             return
+        self._started_at = time.monotonic()
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(), name=f"ct-heartbeat-{self.thread_id}"
+        )
+
+    async def finish(self) -> None:
+        """End the turn. Cancels the heartbeat, removes the working-message,
+        and posts the final assistant text as a fresh Telegram message."""
+        if self._finished:
+            return
+        self._finished = True
+        await self._cancel_heartbeat()
+        if self._errored:
+            # render_error already surfaced the failure; don't post a "final".
+            await self._delete_heartbeat_msg()
+            return
+        await self._delete_heartbeat_msg()
+        final = "\n\n".join(t for t in self._post_tool_texts if t).strip()
+        if not final:
+            # The turn ended with no post-tool assistant text (e.g. Claude only
+            # ran tools and didn't summarize). A short ack keeps the user
+            # informed that the turn actually completed.
+            final = "✓ done"
+        await self._send_final(final)
+
+    # ---- per-envelope hooks (called from bot.py dispatch) -------------------
+
+    async def render_text(self, text: str) -> None:
+        if not text or not text.strip():
+            return
+        self._post_tool_texts.append(text.strip())
+
+    async def render_tool_use(self, tool_name: str, input_data: dict[str, Any]) -> None:
+        # Suppressed in chat. The dispatcher logs it to message_log so the
+        # dashboard sees the call. Only side effect here: track which tool is
+        # currently running so the 10-min heartbeat hint can name it.
+        self._current_tool = tool_name
+
+    async def render_tool_result(self, content: Any, is_error: bool) -> None:
+        # The "post-tool" text buffer resets here. Any assistant text that
+        # arrives next becomes part of the (possibly final) answer; earlier
+        # interludes like "let me check the file" don't leak into the answer.
+        self._current_tool = None
+        self._post_tool_texts = []
+
+    async def render_thinking(self, thinking_text: str = "") -> None:
+        # Quiet by design — chat stays clean. Dispatcher persists the text to
+        # message_log so the dashboard can surface it.
+        return
+
+    async def render_error(self, message: str) -> None:
+        self._errored = True
+        await self._cancel_heartbeat()
+        await self._delete_heartbeat_msg()
+        try:
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                message_thread_id=self.thread_id,
+                text=f"⚠ {message}",
+                disable_notification=self._silent(),
+            )
+        except TelegramBadRequest as exc:
+            log.warning("send_error.failed", error=str(exc))
+
+    # ---- internals ----------------------------------------------------------
+
+    async def _heartbeat_loop(self) -> None:
+        try:
+            await asyncio.sleep(HEARTBEAT_FIRST_DELAY_S)
+            try:
+                msg = await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    message_thread_id=self.thread_id,
+                    text="working…",
+                    # Heartbeats never notify — they're progress indicators,
+                    # not the user-facing answer.
+                    disable_notification=True,
+                )
+                self._heartbeat_msg_id = msg.message_id
+            except TelegramBadRequest as exc:
+                log.warning("heartbeat.send_failed", error=str(exc))
+                return
+
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+                if self._started_at is None:
+                    return
+                elapsed_s = int(time.monotonic() - self._started_at)
+                elapsed_min = elapsed_s // 60
+                text = f"working… ({elapsed_min}m"
+                if elapsed_s >= HEARTBEAT_TOOL_HINT_AFTER_S and self._current_tool:
+                    text += f", running {self._current_tool}"
+                text += ")"
+                try:
+                    await self.bot.edit_message_text(
+                        chat_id=self.chat_id,
+                        message_id=self._heartbeat_msg_id,
+                        text=text,
+                    )
+                except TelegramBadRequest:
+                    # Edit can fail if the user deleted the message, or if the
+                    # text matches what's already there. Either is harmless.
+                    pass
+        except asyncio.CancelledError:
+            pass
+
+    async def _cancel_heartbeat(self) -> None:
+        task = self._heartbeat_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("heartbeat.task_failed_on_cancel")
+
+    async def _delete_heartbeat_msg(self) -> None:
+        msg_id = self._heartbeat_msg_id
+        if msg_id is None:
+            return
+        self._heartbeat_msg_id = None
+        try:
+            await self.bot.delete_message(chat_id=self.chat_id, message_id=msg_id)
+            return
+        except TelegramBadRequest:
+            pass
+        # Fallback: try to edit it to a tiny "done" marker so chat doesn't
+        # leave a stale "working…" line behind. If even that fails we give up.
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.chat_id, message_id=msg_id, text="✓ done",
+            )
+        except TelegramBadRequest:
+            pass
+
+    async def _send_final(self, text: str) -> None:
         silent = self._silent()
         if len(text) <= MAX_TG_MESSAGE:
             try:
@@ -131,130 +232,26 @@ class TopicRenderer:
                     text=text,
                     disable_notification=silent,
                 )
-                return
             except TelegramBadRequest as exc:
-                log.warning("send_message.failed", error=str(exc))
-                return
-        # Oversized: ship as a .txt document with a one-line summary in chat
+                log.warning("send_final.failed", error=str(exc))
+            return
+        # Oversized: spill to .txt document with a one-line summary in chat.
         head = text[:200].splitlines()[0]
         try:
             await self.bot.send_message(
                 chat_id=self.chat_id,
                 message_thread_id=self.thread_id,
-                text=f"[long output — sent as file] {head}",
+                text=f"[long answer — sent as file] {head}",
                 disable_notification=silent,
             )
             await self.bot.send_document(
                 chat_id=self.chat_id,
                 message_thread_id=self.thread_id,
                 document=BufferedInputFile(
-                    text.encode("utf-8", errors="replace"), filename="output.txt"
+                    text.encode("utf-8", errors="replace"),
+                    filename="answer.txt",
                 ),
                 disable_notification=silent,
             )
         except TelegramBadRequest as exc:
-            log.warning("send_document.failed", error=str(exc))
-
-    # ---- public renderers --------------------------------------------------
-
-    async def render_text(self, text: str) -> None:
-        await self._send(text)
-
-    async def render_tool_use(self, tool_name: str, input_data: dict[str, Any]) -> None:
-        # Edit gets a unified diff regardless of size — the format is the same
-        # one a programmer reads in a PR, and small edits read just as well
-        # (often better) than the side-by-side old/new chunks. Above the
-        # inline limit we spill the diff to a document attachment.
-        if tool_name == "Edit":
-            old = input_data.get("old_string", "") or ""
-            new = input_data.get("new_string", "") or ""
-            path = input_data.get("file_path", "") or "file"
-            if len(old) > DIFF_INLINE_LIMIT or len(new) > DIFF_INLINE_LIMIT:
-                await self._render_edit_as_diff(path, old, new)
-                return
-            await self._render_edit_inline_diff(path, old, new)
-            return
-        if tool_name == "Write":
-            content = input_data.get("content", "") or ""
-            if len(content) > DIFF_INLINE_LIMIT:
-                await self._render_write_as_document(
-                    input_data.get("file_path", "") or "file", content
-                )
-                return
-        summary = _format_input_summary(tool_name, input_data)
-        await self._send(f"🔧 {tool_name}\n\n{summary}")
-
-    async def _render_edit_inline_diff(self, path: str, old: str, new: str) -> None:
-        """Inline unified diff for small Edit operations — same format as
-        `git diff`, just kept in chat. Falls back to the simple chunk-based
-        view when the diff would be larger than the chunks (rare; happens for
-        very small edits where header overhead dominates)."""
-        diff = _build_unified_diff(path, old, new)
-        if not diff.strip():
-            await self._send(f"🔧 Edit\n\n{path}\n(no textual change)")
-            return
-        added, removed = _diff_changed_lines(old, new)
-        body = f"🔧 Edit  {path}\n+{added}/-{removed} lines\n\n{diff}"
-        await self._send(body)
-
-    async def _render_edit_as_diff(self, path: str, old: str, new: str) -> None:
-        added, removed = _diff_changed_lines(old, new)
-        diff = _build_unified_diff(path, old, new)
-        if not diff.strip():
-            await self._send(f"🔧 Edit\n\n{path}\n(no textual change)")
-            return
-        header = f"🔧 Edit  {path}\n+{added}/-{removed} lines"
-        silent = self._silent()
-        try:
-            await self.bot.send_message(
-                chat_id=self.chat_id, message_thread_id=self.thread_id, text=header,
-                disable_notification=silent,
-            )
-            await self.bot.send_document(
-                chat_id=self.chat_id,
-                message_thread_id=self.thread_id,
-                document=BufferedInputFile(
-                    diff.encode("utf-8", errors="replace"),
-                    filename=f"{os.path.basename(path) or 'edit'}.diff",
-                ),
-                disable_notification=silent,
-            )
-        except TelegramBadRequest as exc:
-            log.warning("send_diff.failed", error=str(exc))
-
-    async def _render_write_as_document(self, path: str, content: str) -> None:
-        size = len(content)
-        lines = content.count("\n") + 1
-        header = f"📝 Write  {path}\n{lines} lines, {size} bytes"
-        silent = self._silent()
-        try:
-            await self.bot.send_message(
-                chat_id=self.chat_id, message_thread_id=self.thread_id, text=header,
-                disable_notification=silent,
-            )
-            await self.bot.send_document(
-                chat_id=self.chat_id,
-                message_thread_id=self.thread_id,
-                document=BufferedInputFile(
-                    content.encode("utf-8", errors="replace"),
-                    filename=os.path.basename(path) or "new-file.txt",
-                ),
-                disable_notification=silent,
-            )
-        except TelegramBadRequest as exc:
-            log.warning("send_write_doc.failed", error=str(exc))
-
-    async def render_tool_result(self, content: Any, is_error: bool) -> None:
-        body = content if isinstance(content, str) else repr(content)
-        prefix = "✗ tool error" if is_error else "✓ tool result"
-        if not body.strip():
-            await self._send(f"{prefix} (empty)")
-            return
-        await self._send(f"{prefix}\n\n{body}")
-
-    async def render_thinking(self) -> None:
-        # Phase 0: don't surface thinking content (often verbose internal reasoning)
-        pass
-
-    async def render_error(self, message: str) -> None:
-        await self._send(f"⚠ {message}")
+            log.warning("send_final_doc.failed", error=str(exc))

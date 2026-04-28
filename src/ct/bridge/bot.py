@@ -151,6 +151,9 @@ class ResolvedSession:
     # names already in its remembered-allows set. Lives in defaults; per-
     # profile override is deferred.
     auto_allow_tools: tuple[str, ...] = ()
+    # Adaptive thinking on by default. /think on|off changes the per-session
+    # value; /defaults thinking=… can flip the bot-wide default later.
+    thinking: bool = True
 
 
 class BridgeBot:
@@ -244,6 +247,7 @@ class BridgeBot:
         self._router.message.register(self.cmd_macs, Command("macs"))
         self._router.message.register(self.cmd_model, Command("model"))
         self._router.message.register(self.cmd_effort, Command("effort"))
+        self._router.message.register(self.cmd_think, Command("think"))
         self._router.message.register(self.cmd_status, Command("status"))
         self._router.message.register(self.cmd_save, Command("save"))
         self._router.message.register(self.cmd_defaults, Command("defaults"))
@@ -302,6 +306,7 @@ class BridgeBot:
             "  /permissions [mode]  — change mode (or use /m)\n"
             "  /model [name]        — live-swap model (or use /m)\n"
             "  /effort [level]      — set effort (or use /m)\n"
+            "  /think on|off        — toggle adaptive thinking for this session\n"
             "  /close               — close this topic's session\n"
             "  /fork [name]         — branch this session into a new topic\n"
             "  /restart             — reconnect SDK to this transcript (unstick)\n"
@@ -673,6 +678,7 @@ class BridgeBot:
                 mode=resolved.permission_mode,  # type: ignore[arg-type]
                 model=resolved.model,
                 effort=resolved.effort,
+                thinking=resolved.thinking,
                 on_permission_request=perm_handler,
                 on_session_id_assigned=self._make_id_persister(thread_id),
             )
@@ -698,6 +704,7 @@ class BridgeBot:
                 runner_name=runner_name,
                 model=resolved.model,
                 effort=resolved.effort,
+                thinking=resolved.thinking,
             )
         )
         ready_lines = [
@@ -832,6 +839,56 @@ class BridgeBot:
             f"✓ effort → {level}\n"
             f"saved to DB. takes effect when the session is next opened\n"
             f"(/close this topic and /new with effort={level} to apply now)."
+        )
+
+    async def cmd_think(self, message: Message) -> None:
+        """/think on | off | status — toggle adaptive thinking for this session.
+
+        Default for new sessions is ON. Toggle takes effect immediately by
+        reconnecting the SDK with resume=<sdk_session_id> — the conversation
+        continues from the same transcript."""
+        if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
+            await message.answer("/think only works inside a session topic")
+            return
+        session = self.sessions.get(message.message_thread_id)
+        if session is None:
+            await message.answer("no session in this topic.")
+            return
+        if message.text is None:
+            return
+        parts = message.text.strip().split(maxsplit=1)
+        verb = parts[1].strip().lower() if len(parts) >= 2 else "status"
+        if verb in ("status", "show"):
+            state = "on (adaptive)" if session.thinking else "off"
+            await message.answer(
+                f"thinking: {state}\n"
+                f"usage: /think on | off"
+            )
+            return
+        if verb not in ("on", "off"):
+            await message.answer("usage: /think on | off | status")
+            return
+        target = (verb == "on")
+        if target == session.thinking:
+            await message.answer(
+                f"thinking already {'on' if target else 'off'} for this session."
+            )
+            return
+        # Persist first so a crash mid-restart still picks up the new value
+        # on next boot. Then live-reconnect the SDK so the change applies now.
+        session.thinking = target
+        await self.db.update_session_thinking(session.thread_id, target)
+        await message.answer(
+            f"⏳ thinking → {'on' if target else 'off'} — restarting session…"
+        )
+        try:
+            await self._restart_session(session)
+        except Exception as exc:
+            log.exception("think.restart_failed", thread_id=session.thread_id)
+            await message.answer(f"⚠ restart failed: {exc!s}")
+            return
+        await message.answer(
+            f"✓ thinking {'on' if target else 'off'} — transcript intact, ready for next turn."
         )
 
     async def cmd_save(self, message: Message) -> None:
@@ -1122,6 +1179,7 @@ class BridgeBot:
                 mode=resolved.permission_mode,  # type: ignore[arg-type]
                 model=resolved.model,
                 effort=resolved.effort,
+                thinking=resolved.thinking,
                 resume=resume,
                 system_prompt=resolved.system_prompt,
                 auto_allow_tools=list(resolved.auto_allow_tools),
@@ -1148,6 +1206,7 @@ class BridgeBot:
                 runner_name=runner_name,
                 model=resolved.model,
                 effort=resolved.effort,
+                thinking=resolved.thinking,
             )
         )
         suffix = f" ({source_label})" if source_label else ""
@@ -1626,6 +1685,7 @@ class BridgeBot:
             model=session.model,
             effort=session.effort,
             permission_mode=permission_mode,
+            thinking=session.thinking,
         )
         await self._execute_new_session(
             resolved,
@@ -1740,12 +1800,15 @@ class BridgeBot:
         return True
 
     async def _restart_session(self, session: "TopicSession") -> None:
-        """Tear down the runner-side SDK, then re-open with resume on the same
-        thread_id so the in-memory TopicSession swaps to a fresh handle. The
-        DB row is untouched — sdk_session_id, model, effort, mode all persist."""
-        sdk_id = session.runner.session_id
-        if not sdk_id:
-            raise RuntimeError("session has no sdk_session_id")
+        """Tear down the runner-side SDK, then re-open on the same thread_id so
+        the in-memory TopicSession swaps to a fresh handle. The DB row is
+        untouched — sdk_session_id, model, effort, mode all persist.
+
+        If the session never had a first turn yet, `session_id` is None: skip
+        the resume so the fresh SDK starts with an empty transcript (there's
+        nothing to preserve). This lets /think and /restart work right after
+        /new without crashing."""
+        sdk_id = session.runner.session_id  # may be None for a never-turned session
         # Cancel any pending permission card so it doesn't latch on to the
         # dead handle.
         self.permissions_ui.cancel_pending_for(session.runner)
@@ -1778,6 +1841,7 @@ class BridgeBot:
             mode=session.runner.permission_mode,  # type: ignore[arg-type]
             model=session.model,
             effort=session.effort,
+            thinking=session.thinking,
             resume=sdk_id,
             auto_allow_tools=allow_list or None,
             on_permission_request=perm_handler,
@@ -1952,6 +2016,7 @@ class BridgeBot:
             {"kind": "media", "preview": prompt[:120]},
         )
         async with session.turn_lock:
+            renderer.start()
             try:
                 async for env in session.runner.turn(prompt):
                     await self._dispatch_envelope(env, renderer, thread_id)
@@ -1966,6 +2031,8 @@ class BridgeBot:
                 await self.db.log_event(
                     thread_id, "turn_end", {"reason": "success"},
                 )
+            finally:
+                await renderer.finish()
 
     async def on_topic_message(self, message: Message) -> None:
         thread_id = message.message_thread_id
@@ -1989,6 +2056,7 @@ class BridgeBot:
             {"len": len(message.text), "preview": message.text[:120]},
         )
         async with session.turn_lock:
+            renderer.start()
             try:
                 async for env in session.runner.turn(message.text):
                     await self._dispatch_envelope(env, renderer, thread_id)
@@ -2003,6 +2071,8 @@ class BridgeBot:
                 await self.db.log_event(
                     thread_id, "turn_end", {"reason": "success"},
                 )
+            finally:
+                await renderer.finish()
 
     async def _dispatch_envelope(
         self, env: Envelope, renderer: TopicRenderer, thread_id: int | None = None
@@ -2033,7 +2103,15 @@ class BridgeBot:
                     thread_id, "tool_result", {"is_error": is_error},
                 )
         elif env.type == T_THINKING:
-            await renderer.render_thinking()
+            thinking_text = env.payload.get("thinking", "") or ""
+            await renderer.render_thinking(thinking_text)
+            if thread_id is not None and thinking_text.strip():
+                # Persist thinking text so the dashboard can surface it. Trimmed
+                # preview to keep message_log rows bounded.
+                await self.db.log_event(
+                    thread_id, "thinking",
+                    {"len": len(thinking_text), "preview": thinking_text[:240]},
+                )
         elif env.type == T_SYSTEM:
             # Silent for Phase 0/1/2 (init, hook lifecycle, etc.)
             return
@@ -2049,6 +2127,7 @@ class BridgeBot:
             db=self.db,
             bot=self.bot,
             on_close=self._close_session_via_menu,
+            on_restart=self._restart_session,
         ):
             return
         if await menu_ui.handle_defaults_callback(
@@ -2739,6 +2818,7 @@ class BridgeBot:
                 resume=spec.sdk_session_id,
                 model=spec.model,
                 effort=spec.effort,
+                thinking=spec.thinking,
                 on_permission_request=perm_handler,
                 on_session_id_assigned=self._make_id_persister(spec.thread_id),
             )

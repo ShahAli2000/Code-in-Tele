@@ -20,6 +20,12 @@ log = structlog.get_logger(__name__)
 _SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
 
+def _row_to_session(row: tuple) -> "SessionRow":
+    """Build a SessionRow from a 12-column DB row. SQLite returns thinking as
+    an INTEGER (0/1); coerce to bool so callers don't have to remember."""
+    return SessionRow(*row[:11], thinking=bool(row[11]))
+
+
 @dataclass
 class SessionRow:
     thread_id: int
@@ -33,6 +39,9 @@ class SessionRow:
     runner_name: str = "studio"
     model: str | None = None
     effort: str | None = None
+    # 1 = adaptive thinking on, 0 = off. Default ON for new sessions; existing
+    # rows migrate to ON via the column default.
+    thinking: bool = True
 
 
 @dataclass
@@ -114,6 +123,13 @@ class Db:
         if "effort" not in session_cols:
             await self.conn.execute("ALTER TABLE sessions ADD COLUMN effort TEXT")
             log.info("db.migrated", change="sessions.effort added")
+        if "thinking" not in session_cols:
+            # DEFAULT 1 backfills existing rows to thinking-on, matching the
+            # post-migration default for new sessions.
+            await self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN thinking INTEGER NOT NULL DEFAULT 1"
+            )
+            log.info("db.migrated", change="sessions.thinking added")
 
         async with self.conn.execute("PRAGMA table_info(macs)") as cur:
             mac_cols = {row[1] for row in await cur.fetchall()}
@@ -153,15 +169,19 @@ class Db:
         runner_name: str = "studio",
         model: str | None = None,
         effort: str | None = None,
+        thinking: bool = True,
     ) -> None:
         await self.conn.execute(
             """
             INSERT OR REPLACE INTO sessions(
                 thread_id, project_name, cwd, permission_mode, state,
-                runner_name, model, effort
-            ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+                runner_name, model, effort, thinking
+            ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)
             """,
-            (thread_id, project_name, cwd, permission_mode, runner_name, model, effort),
+            (
+                thread_id, project_name, cwd, permission_mode,
+                runner_name, model, effort, 1 if thinking else 0,
+            ),
         )
         await self.conn.commit()
 
@@ -176,6 +196,13 @@ class Db:
         await self.conn.execute(
             "UPDATE sessions SET effort = ?, last_activity = datetime('now') WHERE thread_id = ?",
             (effort, thread_id),
+        )
+        await self.conn.commit()
+
+    async def update_session_thinking(self, thread_id: int, thinking: bool) -> None:
+        await self.conn.execute(
+            "UPDATE sessions SET thinking = ?, last_activity = datetime('now') WHERE thread_id = ?",
+            (1 if thinking else 0, thread_id),
         )
         await self.conn.commit()
 
@@ -218,23 +245,23 @@ class Db:
     async def get_session(self, thread_id: int) -> Optional[SessionRow]:
         async with self.conn.execute(
             "SELECT thread_id, project_name, cwd, sdk_session_id, permission_mode, state, "
-            "created_at, last_activity, runner_name, model, effort "
+            "created_at, last_activity, runner_name, model, effort, thinking "
             "FROM sessions WHERE thread_id = ?",
             (thread_id,),
         ) as cur:
             row = await cur.fetchone()
         if row is None:
             return None
-        return SessionRow(*row)
+        return _row_to_session(row)
 
     async def list_active_sessions(self) -> list[SessionRow]:
         async with self.conn.execute(
             "SELECT thread_id, project_name, cwd, sdk_session_id, permission_mode, state, "
-            "created_at, last_activity, runner_name, model, effort "
+            "created_at, last_activity, runner_name, model, effort, thinking "
             "FROM sessions WHERE state = 'active' ORDER BY created_at"
         ) as cur:
             rows = await cur.fetchall()
-        return [SessionRow(*r) for r in rows]
+        return [_row_to_session(r) for r in rows]
 
     # ---- pending permissions -----------------------------------------------
 

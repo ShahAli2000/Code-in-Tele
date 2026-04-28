@@ -145,7 +145,11 @@ def _translate_assistant(msg: AssistantMessage, sid: str) -> list[Envelope]:
                 )
             )
         elif isinstance(block, ThinkingBlock):
-            out.append(Envelope(T_THINKING, sid, {}))
+            # Carry the actual reasoning text so the dashboard can show it —
+            # chat stays quiet by default, but `/logs` and the web view can
+            # surface what Claude was thinking. Empty thinking blocks are
+            # rare but harmless.
+            out.append(Envelope(T_THINKING, sid, {"thinking": block.thinking or ""}))
         elif isinstance(block, ToolResultBlock):
             # Tool results in an AssistantMessage are server-side tool returns.
             out.append(_translate_tool_result_block(block, sid))
@@ -500,6 +504,8 @@ class RunnerConnection:
         effort = env.payload.get("effort")
         system_prompt = env.payload.get("system_prompt")
         auto_allow_tools = env.payload.get("auto_allow_tools") or []
+        # Default thinking ON when the bridge omits the field (older bridges)
+        thinking = bool(env.payload.get("thinking", True))
         if not isinstance(cwd, str) or not cwd:
             await self._send_error(env.id, "bad_request", "cwd is required")
             return
@@ -534,6 +540,7 @@ class RunnerConnection:
             resume=resume,
             model=model if isinstance(model, str) else None,
             effort=effort if isinstance(effort, str) else None,
+            thinking=thinking,
             system_prompt=system_prompt if isinstance(system_prompt, str) else None,
             auto_allow_tools=auto_allow_set,
             on_permission_request=perm_handler,

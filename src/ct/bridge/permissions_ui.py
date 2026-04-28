@@ -26,7 +26,6 @@ from aiogram.types import (
     InlineKeyboardMarkup,
 )
 
-from ct.bridge.streaming import _format_input_summary
 from ct.sdk_adapter.adapter import PermissionRequest, SessionRunner
 from ct.store.db import Db
 
@@ -55,6 +54,34 @@ def parse_callback_data(data: str) -> tuple[str, str] | None:
     if decision not in ("a", "d", "r") or not tool_use_id:
         return None
     return decision, tool_use_id
+
+
+def _format_input_summary(tool_name: str, input_data: dict) -> str:
+    """Compact, scannable summary of tool input for permission cards.
+    Lives here (not in streaming.py) because the quiet renderer no longer
+    surfaces tool inputs to chat — only this module needs the formatter."""
+    import json as _json
+    if tool_name == "Bash":
+        cmd = input_data.get("command", "")
+        desc = input_data.get("description", "")
+        out = f"$ {cmd}"
+        if desc:
+            out += f"\n# {desc}"
+        return out[:1200]
+    if tool_name in ("Edit", "Write"):
+        path = input_data.get("file_path", "")
+        if tool_name == "Edit":
+            old = (input_data.get("old_string", "") or "")[:300]
+            new = (input_data.get("new_string", "") or "")[:300]
+            return f"{path}\n--- old ---\n{old}\n--- new ---\n{new}"
+        content = (input_data.get("content", "") or "")[:600]
+        return f"{path}\n--- new file ---\n{content}"
+    if tool_name == "Read":
+        return input_data.get("file_path", "")
+    try:
+        return _json.dumps(input_data, indent=2)[:1000]
+    except (TypeError, ValueError):
+        return repr(input_data)[:1000]
 
 
 def _format_card(request: PermissionRequest) -> str:

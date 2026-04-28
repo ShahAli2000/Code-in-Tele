@@ -121,8 +121,9 @@ def open_payload(*, cwd: str, mode: str, resume: str | None = None,
                  system_prompt: str | None = None,
                  model: str | None = None,
                  effort: str | None = None,
+                 thinking: bool = True,
                  auto_allow_tools: list[str] | None = None) -> dict[str, Any]:
-    p: dict[str, Any] = {"cwd": cwd, "mode": mode}
+    p: dict[str, Any] = {"cwd": cwd, "mode": mode, "thinking": bool(thinking)}
     if resume is not None:
         p["resume"] = resume
     if system_prompt is not None:

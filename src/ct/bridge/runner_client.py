@@ -694,6 +694,7 @@ class RunnerConnection:
         resume: str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        thinking: bool = True,
         system_prompt: str | None = None,
         auto_allow_tools: list[str] | None = None,
         on_permission_request: PermissionHandler | None = None,
@@ -717,6 +718,7 @@ class RunnerConnection:
                 T_OPEN, sid,
                 open_payload(
                     cwd=cwd, mode=mode, resume=resume, model=model, effort=effort,
+                    thinking=thinking,
                     system_prompt=system_prompt,
                     auto_allow_tools=auto_allow_tools,
                 ),

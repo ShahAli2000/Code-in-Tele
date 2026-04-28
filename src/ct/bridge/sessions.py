@@ -34,6 +34,9 @@ class TopicSession:
     runner_name: str = "studio"
     model: str | None = None
     effort: str | None = None
+    # Adaptive thinking on by default. Persists across restart via
+    # sessions.thinking; toggle per-session via /think.
+    thinking: bool = True
 
 
 @dataclass
@@ -46,6 +49,7 @@ class RestoreSpec:
     runner_name: str = "studio"
     model: str | None = None
     effort: str | None = None
+    thinking: bool = True
 
 
 # Bridge supplies this when calling restore(). Given the persisted metadata
@@ -76,6 +80,7 @@ class SessionStore:
             runner_name=session.runner_name,
             model=session.model,
             effort=session.effort,
+            thinking=session.thinking,
         )
         self._by_thread[session.thread_id] = session
 
@@ -138,6 +143,7 @@ class SessionStore:
                 runner_name=row.runner_name or default_runner_name,
                 model=row.model,
                 effort=row.effort,
+                thinking=row.thinking,
             )
             try:
                 handle = await factory(spec)
@@ -160,6 +166,7 @@ class SessionStore:
                 runner_name=spec.runner_name,
                 model=spec.model,
                 effort=spec.effort,
+                thinking=spec.thinking,
             )
             restored += 1
             log.info(

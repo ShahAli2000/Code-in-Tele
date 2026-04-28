@@ -38,6 +38,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="permissions", description="Show or change permission mode"),
     BotCommand(command="model",       description="Show or live-swap the model"),
     BotCommand(command="effort",      description="Show or set effort level"),
+    BotCommand(command="think",       description="Toggle adaptive thinking on|off for this session"),
     BotCommand(command="close",       description="Close this topic's session"),
     BotCommand(command="fork",        description="Branch this session into a new topic"),
     BotCommand(command="restart",     description="Reattach SDK to this transcript (unstick)"),

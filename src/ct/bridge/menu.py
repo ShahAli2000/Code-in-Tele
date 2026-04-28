@@ -65,15 +65,17 @@ def _format_root(session: "TopicSession") -> str:
     return (
         f"📁 {session.project_name}  ·  {session.runner_name}:{session.cwd}\n"
         f"\n"
-        f"model:   {session.model or '(SDK default)'}\n"
-        f"effort:  {session.effort or '(SDK default)'}\n"
-        f"mode:    {runner.permission_mode}"
+        f"model:    {session.model or '(SDK default)'}\n"
+        f"effort:   {session.effort or '(SDK default)'}\n"
+        f"thinking: {'on' if session.thinking else 'off'}\n"
+        f"mode:     {runner.permission_mode}"
     )
 
 
 def _root_keyboard(sid: str, session: "TopicSession") -> InlineKeyboardMarkup:
     runner = session.runner
     model_label = (session.model or "default").rsplit("-", 1)[0].replace("claude-", "")
+    think_label = "💭 think on" if session.thinking else "💭 think off"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -90,6 +92,10 @@ def _root_keyboard(sid: str, session: "TopicSession") -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text=f"⚙ {runner.permission_mode}",
                     callback_data=_cb(sid, "pick", "mode"),
+                ),
+                InlineKeyboardButton(
+                    text=think_label,
+                    callback_data=_cb(sid, "think_toggle"),
                 ),
             ],
             [
@@ -175,6 +181,7 @@ async def handle_callback(
     db,                   # ct.store.db.Db
     bot: Bot,
     on_close,             # async callable: (TopicSession) -> None
+    on_restart=None,      # async callable: (TopicSession) -> None | None
 ) -> bool:
     """Returns True if this callback was for the action card."""
     parsed = parse_callback(query.data or "")
@@ -244,6 +251,32 @@ async def handle_callback(
             keyboard=None,
         )
         await query.answer("closed")
+        return True
+    if verb == "think_toggle":
+        target = not session.thinking
+        # Persist first so a crash mid-restart still picks up the new value.
+        session.thinking = target
+        await db.update_session_thinking(session.thread_id, target)
+        await _safe_edit(
+            bot, query,
+            text=_format_root(session) + "\n\n⏳ restarting session…",
+            keyboard=None,
+        )
+        if on_restart is not None:
+            try:
+                await on_restart(session)
+            except Exception:
+                log.exception(
+                    "menu.think_toggle_restart_failed",
+                    thread_id=session.thread_id,
+                )
+                await query.answer("restart failed — see logs", show_alert=True)
+                return True
+        await _safe_edit(
+            bot, query, text=_format_root(session),
+            keyboard=_root_keyboard(sid, session),
+        )
+        await query.answer(f"thinking → {'on' if target else 'off'}")
         return True
     await query.answer("unknown verb", show_alert=False)
     return True

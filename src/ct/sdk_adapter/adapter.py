@@ -142,6 +142,7 @@ class SessionRunner:
         system_prompt: str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        thinking: bool = True,
         auto_allow_tools: set[str] | None = None,
     ) -> None:
         self.cwd = cwd
@@ -152,6 +153,10 @@ class SessionRunner:
         self.system_prompt = system_prompt
         self.model = model
         self.effort = effort
+        # Adaptive thinking on by default — Claude picks the budget per turn.
+        # The bridge defaults `True`; toggle off via `/think off`. Plumbed into
+        # ClaudeAgentOptions.thinking at SDK connect time.
+        self.thinking = thinking
         # Tools the user has pre-trusted bot-wide (or per-profile, when that
         # plumbing arrives). Same in-memory set as approve-and-remember
         # populates at runtime — same trust ledger, different seed source.
@@ -231,6 +236,11 @@ class SessionRunner:
             options_kwargs["model"] = self.model
         if self.effort is not None:
             options_kwargs["effort"] = self.effort
+        # Thinking is set explicitly either way — passing the disabled config
+        # rather than None future-proofs against any model whose default flips.
+        options_kwargs["thinking"] = (
+            {"type": "adaptive"} if self.thinking else {"type": "disabled"}
+        )
         options = ClaudeAgentOptions(**options_kwargs)
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()

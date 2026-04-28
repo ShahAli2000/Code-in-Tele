@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     runner_name      TEXT    NOT NULL DEFAULT 'studio',
     model            TEXT,                          -- nullable; SDK default if NULL
     effort           TEXT,                          -- 'low' | 'medium' | 'high' | 'max'; null = SDK default
+    thinking         INTEGER NOT NULL DEFAULT 1,    -- 1 = adaptive thinking on, 0 = off
     created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
     last_activity    TEXT    NOT NULL DEFAULT (datetime('now'))
 );
