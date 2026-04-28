@@ -44,6 +44,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="restart",     description="Reattach SDK to this transcript (unstick)"),
     BotCommand(command="undo",        description="Reverse last destructive action within 30 min"),
     BotCommand(command="move",        description="Migrate this session to another mac (mac=NAME)"),
+    BotCommand(command="resume",      description="Re-attach orphaned sessions when the runner is back online"),
     BotCommand(command="logs",        description="Show last N transcript entries"),
     BotCommand(command="export",      description="Export full transcript as markdown"),
     BotCommand(command="get",         description="Download a file from the runner (/get <path>)"),

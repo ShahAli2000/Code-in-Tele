@@ -264,6 +264,7 @@ class BridgeBot:
         self._router.message.register(self.cmd_restart, Command("restart"))
         self._router.message.register(self.cmd_undo, Command("undo"))
         self._router.message.register(self.cmd_move, Command("move"))
+        self._router.message.register(self.cmd_resume, Command("resume"))
         self._router.message.register(self.cmd_logs, Command("logs"))
         self._router.message.register(self.cmd_export, Command("export"))
         self._router.message.register(self.cmd_get, Command("get"))
@@ -321,6 +322,7 @@ class BridgeBot:
             "  /restart             — reconnect SDK to this transcript (unstick)\n"
             "  /undo                — reverse last destructive action (close, profile delete) within 30 min\n"
             "  /move mac=NAME       — migrate this session to another runner (transcript preserved)\n"
+            "  /resume              — re-attach orphaned sessions (mac was offline at boot)\n"
             "  /logs [N]            — show last N transcript entries (default 15)\n"
             "  /export              — full transcript as a markdown file\n"
             "  /get <path>          — download a file from this session's runner\n"
@@ -1874,6 +1876,137 @@ class BridgeBot:
             )
         )
 
+    async def cmd_resume(self, message: Message) -> None:
+        """/resume — list orphaned sessions and offer re-attach buttons.
+
+        A session is orphaned when its runner was unreachable at bridge boot
+        (mac asleep, runner crashed). The DB row keeps `runner_name` and
+        `sdk_session_id` so we can re-open the SDK with resume= once the mac
+        is back online. Buttons are tagged with thread_id so they survive a
+        bridge restart (the row is still there)."""
+        rows = await self.db.list_orphaned_sessions()
+        if not rows:
+            await message.answer("✓ no orphaned sessions.")
+            return
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        lines = ["orphaned sessions (tap to resume):"]
+        buttons: list[list[InlineKeyboardButton]] = []
+        for row in rows:
+            # 🟢 if its runner is currently connected (resume should succeed),
+            # 🔴 otherwise (the user can still tap; we'll surface the failure).
+            try:
+                conn = self.runners.get(row.runner_name)
+                emoji = "🟢" if conn.connected else "🔴"
+            except KeyError:
+                emoji = "❌"  # runner no longer registered — unrecoverable
+            sdk_short = (row.sdk_session_id or "")[:8] or "(no sdk id)"
+            lines.append(
+                f"  {emoji} {row.project_name} · {row.runner_name} · sdk={sdk_short}"
+            )
+            buttons.append([InlineKeyboardButton(
+                text=f"↻ resume {row.project_name}",
+                callback_data=f"ct:rsm:{row.thread_id}",
+            )])
+        await message.answer(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+    async def _handle_resume_callback(self, query: CallbackQuery) -> bool:
+        data = query.data or ""
+        if not data.startswith("ct:rsm:"):
+            return False
+        try:
+            thread_id = int(data[len("ct:rsm:"):])
+        except ValueError:
+            await query.answer("malformed")
+            return True
+        row = await self.db.get_session(thread_id)
+        if row is None:
+            await query.answer("no DB row", show_alert=True)
+            return True
+        if row.state != "orphaned":
+            await query.answer(f"state is {row.state!r}, not orphaned", show_alert=True)
+            return True
+        if not row.sdk_session_id:
+            await query.answer(
+                "no sdk_session_id — never had a first turn, nothing to resume",
+                show_alert=True,
+            )
+            return True
+        try:
+            conn = self.runners.get(row.runner_name)
+        except KeyError:
+            await query.answer(
+                f"runner {row.runner_name!r} is no longer registered — /macs add first",
+                show_alert=True,
+            )
+            return True
+        if not conn.connected:
+            await query.answer(
+                f"{row.runner_name!r} isn't connected — wake it up and try again",
+                show_alert=True,
+            )
+            return True
+
+        # Walk the same open-session path /new uses, but with resume= and
+        # the persisted options off the row. perm_handler captures the new
+        # handle through the box trick so future approval cards route right.
+        handle_box: list[SessionHandle] = []
+
+        async def perm_handler(req: PermissionRequest) -> None:
+            await self.permissions_ui.render_card(
+                runner=handle_box[0],
+                chat_id=self.settings.telegram_chat_id,
+                thread_id=thread_id,
+                request=req,
+            )
+
+        try:
+            handle = await conn.open_session(
+                sid=str(thread_id),
+                cwd=row.cwd,
+                mode=row.permission_mode,  # type: ignore[arg-type]
+                model=row.model,
+                effort=row.effort,
+                thinking=row.thinking,
+                resume=row.sdk_session_id,
+                on_permission_request=perm_handler,
+                on_session_id_assigned=self._make_id_persister(thread_id),
+            )
+        except Exception as exc:
+            log.exception("resume.open_failed", thread_id=thread_id)
+            await query.answer(f"resume failed: {exc!s}", show_alert=True)
+            return True
+        handle_box.append(handle)
+
+        # sessions.add does INSERT OR REPLACE which flips state back to
+        # 'active' and updates the in-memory map.
+        await self.sessions.add(TopicSession(
+            thread_id=thread_id,
+            project_name=row.project_name,
+            cwd=row.cwd,
+            runner=handle,
+            turn_lock=asyncio.Lock(),
+            runner_name=row.runner_name,
+            model=row.model,
+            effort=row.effort,
+            thinking=row.thinking,
+        ))
+
+        await query.answer(f"resumed {row.project_name}")
+        # Confirm in the session's topic itself so the user sees the resume
+        # in the right place when they switch to it.
+        try:
+            await self.bot.send_message(
+                chat_id=self.settings.telegram_chat_id,
+                message_thread_id=thread_id,
+                text="✓ session resumed — transcript intact, ready for next turn.",
+            )
+        except Exception:
+            log.exception("resume.topic_post_failed", thread_id=thread_id)
+        return True
+
     async def cmd_move(self, message: Message) -> None:
         """/move mac=<dest> — migrate this session to another runner.
 
@@ -2475,6 +2608,8 @@ class BridgeBot:
         if await self._handle_browse_callback(query):
             return
         if await self._handle_new_menu_callback(query):
+            return
+        if await self._handle_resume_callback(query):
             return
         if await self._handle_close_confirm_callback(query):
             return

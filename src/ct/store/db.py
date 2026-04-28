@@ -274,6 +274,18 @@ class Db:
             rows = await cur.fetchall()
         return [_row_to_session(r) for r in rows]
 
+    async def list_orphaned_sessions(self) -> list[SessionRow]:
+        """Sessions whose runner was unreachable at restore time. /resume
+        walks these and offers to re-open each on its registered runner
+        once the mac is back online."""
+        async with self.conn.execute(
+            "SELECT thread_id, project_name, cwd, sdk_session_id, permission_mode, state, "
+            "created_at, last_activity, runner_name, model, effort, thinking "
+            "FROM sessions WHERE state = 'orphaned' ORDER BY last_activity DESC"
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_session(r) for r in rows]
+
     # ---- pending permissions -----------------------------------------------
 
     async def insert_pending_permission(
