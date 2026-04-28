@@ -7,7 +7,8 @@ needed — schema.sql uses CREATE IF NOT EXISTS so re-running on boot is safe.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -70,6 +71,10 @@ class MacRow:
     added_at: str
     last_connected: str | None
     main_dir: str | None = None
+    # Optional list of shortcut paths the user can quick-jump to from the
+    # browse picker. Stored as a JSON array of strings; an empty list (or
+    # None) means "no shortcuts; browse opens main_dir directly".
+    shortcuts: list[str] = field(default_factory=list)
 
 
 class Db:
@@ -115,6 +120,9 @@ class Db:
         if "main_dir" not in mac_cols:
             await self.conn.execute("ALTER TABLE macs ADD COLUMN main_dir TEXT")
             log.info("db.migrated", change="macs.main_dir added")
+        if "shortcuts" not in mac_cols:
+            await self.conn.execute("ALTER TABLE macs ADD COLUMN shortcuts TEXT")
+            log.info("db.migrated", change="macs.shortcuts added")
 
         async with self.conn.execute("PRAGMA table_info(profiles)") as cur:
             profile_cols = {row[1] for row in await cur.fetchall()}
@@ -515,12 +523,21 @@ class Db:
 
     async def get_mac(self, name: str) -> MacRow | None:
         async with self.conn.execute(
-            "SELECT name, host, port, added_at, last_connected, main_dir "
-            "FROM macs WHERE name = ?",
+            "SELECT name, host, port, added_at, last_connected, main_dir, "
+            "shortcuts FROM macs WHERE name = ?",
             (name,),
         ) as cur:
             row = await cur.fetchone()
-        return MacRow(*row) if row else None
+        return _macrow_from_row(row) if row else None
+
+    async def update_mac_shortcuts(self, name: str, shortcuts: list[str]) -> None:
+        """Replace the shortcuts list for `name`. Pass an empty list to clear.
+        Stored as a JSON array so SQLite stays type-stable."""
+        body = json.dumps(list(shortcuts)) if shortcuts else None
+        await self.conn.execute(
+            "UPDATE macs SET shortcuts = ? WHERE name = ?", (body, name),
+        )
+        await self.conn.commit()
 
     async def remove_mac(self, name: str) -> bool:
         async with self.conn.execute(
@@ -539,8 +556,26 @@ class Db:
 
     async def list_macs(self) -> list[MacRow]:
         async with self.conn.execute(
-            "SELECT name, host, port, added_at, last_connected, main_dir "
-            "FROM macs ORDER BY name"
+            "SELECT name, host, port, added_at, last_connected, main_dir, "
+            "shortcuts FROM macs ORDER BY name"
         ) as cur:
             rows = await cur.fetchall()
-        return [MacRow(*r) for r in rows]
+        return [_macrow_from_row(r) for r in rows]
+
+
+def _macrow_from_row(row: tuple) -> MacRow:
+    """Build a MacRow from a 7-tuple SELECT, decoding the JSON shortcuts col."""
+    raw_shortcuts = row[6]
+    parsed: list[str] = []
+    if raw_shortcuts:
+        try:
+            decoded = json.loads(raw_shortcuts)
+            if isinstance(decoded, list):
+                parsed = [s for s in decoded if isinstance(s, str)]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return MacRow(
+        name=row[0], host=row[1], port=row[2],
+        added_at=row[3], last_connected=row[4], main_dir=row[5],
+        shortcuts=parsed,
+    )

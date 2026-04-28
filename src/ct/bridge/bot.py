@@ -193,6 +193,11 @@ class BridgeBot:
         # Browse-flow state per browse-card message_id.
         # Shape: {mac, path, main_dir, name, show_hidden, items: [(name, is_dir)]}
         self._browse_state: dict[int, dict[str, Any]] = {}
+        # When a mac has shortcuts, the browse entry shows a picker before
+        # drilling in. Keyed by the picker message_id; cleared when the user
+        # taps a starting point.
+        # Shape: {mac_name, show_hidden, paths: [main_dir, *shortcuts]}
+        self._browse_starting_points: dict[int, dict[str, Any]] = {}
         self.dp = Dispatcher()
         self._router = Router()
         self._wire_middleware_and_handlers()
@@ -336,37 +341,100 @@ class BridgeBot:
         else:
             await message.answer(
                 "usage:\n"
-                "  /macs                                  — list registered runners\n"
-                "  /macs add NAME HOST [PORT]             — register a runner\n"
-                "  /macs remove NAME                      — drop a runner\n"
-                "  /macs config NAME main_dir=<path>      — set the browse root for that mac"
+                "  /macs                                       — list registered runners\n"
+                "  /macs add NAME HOST [PORT]                  — register a runner\n"
+                "  /macs remove NAME                           — drop a runner\n"
+                "  /macs config NAME main_dir=<path>           — set the browse root\n"
+                "  /macs config NAME add_shortcut=<path>       — add a browse shortcut\n"
+                "  /macs config NAME rm_shortcut=<path>        — remove a shortcut\n"
+                "  /macs config NAME show                      — show current config"
             )
 
     async def _macs_config(self, message: Message, rest_tokens: list[str]) -> None:
         if not rest_tokens:
-            await message.answer("usage: /macs config NAME main_dir=<path>")
+            await message.answer(
+                "usage: /macs config NAME [main_dir=<path>] "
+                "[add_shortcut=<path>] [rm_shortcut=<path>] [show]"
+            )
             return
         name = rest_tokens[0]
         if name not in self.runners.names() and not await self.db.get_mac(name):
             await message.answer(f"⚠ no mac registered as {name!r}")
             return
+        mac_row = await self.db.get_mac(name)
+        if mac_row is None:
+            # Studio-only edge case: insert minimal row
+            conn = self.runners.get(name)
+            await self.db.insert_mac(name, conn.host, conn.port)
+            mac_row = await self.db.get_mac(name)
+
         new_main_dir: str | None = None
+        add_shortcut: str | None = None
+        rm_shortcut: str | None = None
+        show_only = False
         for tok in rest_tokens[1:]:
             if tok.startswith("main_dir="):
                 new_main_dir = tok[len("main_dir="):]
-        if new_main_dir is None:
+            elif tok.startswith("add_shortcut="):
+                add_shortcut = tok[len("add_shortcut="):]
+            elif tok.startswith("rm_shortcut="):
+                rm_shortcut = tok[len("rm_shortcut="):]
+            elif tok == "show":
+                show_only = True
+
+        if show_only and not (new_main_dir or add_shortcut or rm_shortcut):
+            await self._macs_config_show(message, name, mac_row)
+            return
+
+        changes: list[str] = []
+        # main_dir
+        if new_main_dir is not None:
+            if new_main_dir.lower() in ("null", "none", ""):
+                await self.db.update_mac_main_dir(name, None)
+                changes.append("main_dir cleared (uses $HOME)")
+            else:
+                await self.db.update_mac_main_dir(name, new_main_dir)
+                changes.append(f"main_dir = {new_main_dir}")
+        # shortcuts: add/rm operate on the current list (re-read after main_dir
+        # update is fine — we don't read main_dir back from mac_row).
+        current_shortcuts = list(mac_row.shortcuts if mac_row else [])
+        if add_shortcut:
+            if add_shortcut not in current_shortcuts:
+                current_shortcuts.append(add_shortcut)
+                await self.db.update_mac_shortcuts(name, current_shortcuts)
+                changes.append(f"+ shortcut: {add_shortcut}")
+            else:
+                changes.append(f"shortcut already exists: {add_shortcut}")
+        if rm_shortcut:
+            if rm_shortcut in current_shortcuts:
+                current_shortcuts.remove(rm_shortcut)
+                await self.db.update_mac_shortcuts(name, current_shortcuts)
+                changes.append(f"- shortcut: {rm_shortcut}")
+            else:
+                changes.append(f"shortcut not found: {rm_shortcut}")
+
+        if not changes:
             await message.answer(
-                "usage: /macs config NAME main_dir=<path>\n"
-                "(currently the only configurable field)"
+                "⚠ nothing to change. /macs config NAME show prints current."
             )
             return
-        # null/none clears
-        if new_main_dir.lower() in ("null", "none", ""):
-            await self.db.update_mac_main_dir(name, None)
-            await message.answer(f"✓ {name}: main_dir cleared (will use $HOME)")
+        await message.answer(f"✓ {name}:\n" + "\n".join(f"  {c}" for c in changes))
+
+    async def _macs_config_show(
+        self, message: Message, name: str, mac_row: Any | None,
+    ) -> None:
+        if mac_row is None:
+            await message.answer(f"⚠ {name!r} has no row in the macs table yet")
+            return
+        lines = [f"⚙️  {name}"]
+        lines.append(f"  main_dir:  {mac_row.main_dir or '(default $HOME)'}")
+        if mac_row.shortcuts:
+            lines.append("  shortcuts:")
+            for s in mac_row.shortcuts:
+                lines.append(f"    • {s}")
         else:
-            await self.db.update_mac_main_dir(name, new_main_dir)
-            await message.answer(f"✓ {name}: main_dir = {new_main_dir}")
+            lines.append("  shortcuts: (none)")
+        await message.answer("\n".join(lines))
 
     async def _macs_list(self, message: Message) -> None:
         names = self.runners.names()
@@ -1993,6 +2061,39 @@ class BridgeBot:
             await self._begin_browse(query, mac_name, show_hidden=False)
             return True
 
+        # Starting-point picker (multi-shortcut mac). Click a row → drill in.
+        if verb == "pick" and len(parts) >= 2:
+            if query.message is None:
+                await query.answer()
+                return True
+            picker = self._browse_starting_points.pop(query.message.message_id, None)
+            if picker is None:
+                await query.answer(
+                    "picker expired — tap [📂 browse] again", show_alert=True,
+                )
+                return True
+            try:
+                idx = int(parts[1])
+            except ValueError:
+                await query.answer("malformed")
+                return True
+            paths = picker["paths"]
+            if not (0 <= idx < len(paths)):
+                await query.answer("out of range")
+                return True
+            try:
+                conn = self.runners.get(picker["mac_name"])
+            except KeyError:
+                await query.answer(
+                    f"runner {picker['mac_name']!r} not registered", show_alert=True,
+                )
+                return True
+            await self._open_browse_at(
+                query, mac_name=picker["mac_name"], conn=conn,
+                path=paths[idx], show_hidden=picker.get("show_hidden", False),
+            )
+            return True
+
         # Past this point, all verbs operate on the per-message browse state.
         if query.message is None:
             await query.answer("no message")
@@ -2060,18 +2161,67 @@ class BridgeBot:
             return
         mac_row = await self.db.get_mac(mac_name)
         main_dir = (mac_row.main_dir if mac_row else None) or "~"
+        shortcuts = list(mac_row.shortcuts) if mac_row else []
+        # When shortcuts are configured, ask the user to pick a starting point
+        # before drilling in. Without shortcuts, behaviour is unchanged.
+        if shortcuts:
+            await self._render_starting_point_picker(
+                query, mac_name=mac_name, main_dir=main_dir,
+                shortcuts=shortcuts, show_hidden=show_hidden,
+            )
+            return
+        await self._open_browse_at(
+            query, mac_name=mac_name, conn=conn, path=main_dir,
+            show_hidden=show_hidden,
+        )
+
+    async def _render_starting_point_picker(
+        self, query: CallbackQuery, *, mac_name: str, main_dir: str,
+        shortcuts: list[str], show_hidden: bool,
+    ) -> None:
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        # callback_data is bounded — use a per-message map keyed by index so
+        # long paths don't blow the 64-byte budget.
+        if query.message is None:
+            await query.answer()
+            return
+        starting_points = [main_dir, *shortcuts]
+        msg_id = query.message.message_id
+        self._browse_starting_points[msg_id] = {
+            "mac_name": mac_name,
+            "show_hidden": show_hidden,
+            "paths": starting_points,
+        }
+        rows: list[list[InlineKeyboardButton]] = []
+        for i, p in enumerate(starting_points):
+            label = "🏠 " + p if i == 0 else "📁 " + p
+            # Telegram caps button text at 64 chars
+            if len(label) > 60:
+                label = label[:57] + "…"
+            rows.append([InlineKeyboardButton(
+                text=label, callback_data=f"ct:b:pick:{i}",
+            )])
+        await menu_ui._safe_edit(
+            self.bot, query,
+            text=f"📂 browse {mac_name} — pick a starting folder:",
+            keyboard=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+        await query.answer()
+
+    async def _open_browse_at(
+        self, query: CallbackQuery, *, mac_name: str, conn: Any, path: str,
+        show_hidden: bool,
+    ) -> None:
         try:
-            resolved_path, items = await conn.list_dir(main_dir, show_hidden=show_hidden)
+            resolved_path, items = await conn.list_dir(path, show_hidden=show_hidden)
         except Exception as exc:
             await menu_ui._safe_edit(
                 self.bot, query,
-                text=f"⚠ couldn't list {mac_name}:{main_dir}\n\n{exc!s}",
+                text=f"⚠ couldn't list {mac_name}:{path}\n\n{exc!s}",
                 keyboard=None,
             )
             await query.answer()
             return
-        # Remember the resolved main_dir so 'up' knows when not to go further
-        # (we let it go above main_dir but limit at the filesystem root)
         state = {
             "mac": mac_name,
             "path": resolved_path,
