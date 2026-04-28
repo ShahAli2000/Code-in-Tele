@@ -695,6 +695,7 @@ class RunnerConnection:
         model: str | None = None,
         effort: str | None = None,
         system_prompt: str | None = None,
+        auto_allow_tools: list[str] | None = None,
         on_permission_request: PermissionHandler | None = None,
         on_session_id_assigned: SdkIdHandler | None = None,
     ) -> SessionHandle:
@@ -717,6 +718,7 @@ class RunnerConnection:
                 open_payload(
                     cwd=cwd, mode=mode, resume=resume, model=model, effort=effort,
                     system_prompt=system_prompt,
+                    auto_allow_tools=auto_allow_tools,
                 ),
             )
         )

@@ -499,6 +499,7 @@ class RunnerConnection:
         model = env.payload.get("model")
         effort = env.payload.get("effort")
         system_prompt = env.payload.get("system_prompt")
+        auto_allow_tools = env.payload.get("auto_allow_tools") or []
         if not isinstance(cwd, str) or not cwd:
             await self._send_error(env.id, "bad_request", "cwd is required")
             return
@@ -523,6 +524,10 @@ class RunnerConnection:
         async def id_persister(sdk_session_id: str) -> None:
             await self._send(Envelope(T_SDK_ID, env.id, sdk_id_payload(sdk_session_id)))
 
+        auto_allow_set: set[str] = (
+            {t for t in auto_allow_tools if isinstance(t, str) and t}
+            if isinstance(auto_allow_tools, list) else set()
+        )
         runner = SessionRunner(
             cwd=cwd,
             permission_mode=mode,  # type: ignore[arg-type]
@@ -530,6 +535,7 @@ class RunnerConnection:
             model=model if isinstance(model, str) else None,
             effort=effort if isinstance(effort, str) else None,
             system_prompt=system_prompt if isinstance(system_prompt, str) else None,
+            auto_allow_tools=auto_allow_set,
             on_permission_request=perm_handler,
             on_session_id_assigned=id_persister,
         )

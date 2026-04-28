@@ -120,7 +120,8 @@ class ProtocolError(ValueError):
 def open_payload(*, cwd: str, mode: str, resume: str | None = None,
                  system_prompt: str | None = None,
                  model: str | None = None,
-                 effort: str | None = None) -> dict[str, Any]:
+                 effort: str | None = None,
+                 auto_allow_tools: list[str] | None = None) -> dict[str, Any]:
     p: dict[str, Any] = {"cwd": cwd, "mode": mode}
     if resume is not None:
         p["resume"] = resume
@@ -130,6 +131,8 @@ def open_payload(*, cwd: str, mode: str, resume: str | None = None,
         p["model"] = model
     if effort is not None:
         p["effort"] = effort
+    if auto_allow_tools:
+        p["auto_allow_tools"] = list(auto_allow_tools)
     return p
 
 

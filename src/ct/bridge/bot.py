@@ -146,6 +146,10 @@ class ResolvedSession:
     # one). Appended to Claude Code's default + git/test directives at session
     # open. None when not set or no profile was used.
     system_prompt: str | None = None
+    # Bot-wide pre-trusted tools — every new session starts with these tool
+    # names already in its remembered-allows set. Lives in defaults; per-
+    # profile override is deferred.
+    auto_allow_tools: tuple[str, ...] = ()
 
 
 class BridgeBot:
@@ -245,6 +249,7 @@ class BridgeBot:
         self._router.message.register(self.cmd_quiet, Command("quiet"))
         self._router.message.register(self.cmd_search, Command("search"))
         self._router.message.register(self.cmd_stats, Command("stats"))
+        self._router.message.register(self.cmd_allow, Command("allow"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
 
         # Single text-message handler. Dispatches:
@@ -297,6 +302,7 @@ class BridgeBot:
             "  /quiet [HH:MM HH:MM] — silence non-permission pings during a window\n"
             "  /search <pattern>    — substring search across all past transcripts\n"
             "  /stats               — turns, tool use, active sessions (from message_log)\n"
+            "  /allow               — bot-wide auto-allow tool list (skip approval cards)\n"
             "  /macs [add|remove]   — manage registered runners\n"
             "  /status              — uptime, runners, sessions\n\n"
             "Just type in a topic to talk to Claude.\n"
@@ -516,6 +522,11 @@ class BridgeBot:
             profile.permission_mode if profile else None,
             defaults.get("default_permission_mode"),
         ) or "acceptEdits"
+        # Auto-allow tools is a bot-wide default for now (no profile override).
+        auto_allow_csv = (defaults.get("default_auto_allow_tools") or "").strip()
+        auto_allow = tuple(
+            t.strip() for t in auto_allow_csv.split(",") if t.strip()
+        )
         return ResolvedSession(
             name=args.name,
             cwd=cwd,
@@ -524,6 +535,7 @@ class BridgeBot:
             effort=effort,
             permission_mode=mode,
             system_prompt=profile.system_prompt if profile else None,
+            auto_allow_tools=auto_allow,
         )
 
     async def cmd_new(self, message: Message) -> None:
@@ -824,6 +836,60 @@ class BridgeBot:
             return
         await message.answer("✓ defaults updated:\n" + "\n".join(changes))
 
+    async def cmd_allow(self, message: Message) -> None:
+        """Show or set the bot-wide auto-allow tool list. Tools in this set
+        are pre-approved at session start — no permission card the first time
+        they're used. Affects future sessions; current sessions keep whatever
+        their `_remembered_allows` already contains.
+
+        Usage:
+            /allow                     — show current
+            /allow Read,Glob,Grep      — set CSV
+            /allow off                 — clear
+            /allow add Bash            — add one tool
+            /allow rm Bash             — remove one tool
+        """
+        text = (message.text or "").strip()
+        parts = text.split()
+        current_csv = (self._defaults_cache.get("default_auto_allow_tools") or "").strip()
+        current_set: set[str] = set(
+            t.strip() for t in current_csv.split(",") if t.strip()
+        )
+
+        if len(parts) == 1:
+            shown = ", ".join(sorted(current_set)) if current_set else "(none)"
+            await message.answer(
+                f"🔓 auto-allow tools (bot-wide)\n"
+                f"current: {shown}\n\n"
+                f"set:    /allow Read,Glob,Grep\n"
+                f"add:    /allow add Bash\n"
+                f"rm:     /allow rm Bash\n"
+                f"clear:  /allow off\n\n"
+                f"applies to NEW sessions; current sessions keep their own ledger."
+            )
+            return
+
+        if len(parts) == 2 and parts[1].lower() == "off":
+            new_set: set[str] = set()
+        elif len(parts) == 3 and parts[1].lower() == "add":
+            new_set = current_set | {parts[2]}
+        elif len(parts) == 3 and parts[1].lower() == "rm":
+            new_set = current_set - {parts[2]}
+        elif len(parts) == 2 and parts[1] not in {"add", "rm", "off"}:
+            # Treat as full CSV replacement
+            new_set = {t.strip() for t in parts[1].split(",") if t.strip()}
+        else:
+            await message.answer(
+                "usage: /allow [CSV | add NAME | rm NAME | off]"
+            )
+            return
+
+        new_csv = ",".join(sorted(new_set)) if new_set else None
+        await self.db.set_default("default_auto_allow_tools", new_csv)
+        self._defaults_cache["default_auto_allow_tools"] = new_csv
+        shown = ", ".join(sorted(new_set)) if new_set else "(none)"
+        await message.answer(f"✓ auto-allow now: {shown}")
+
     async def cmd_menu(self, message: Message) -> None:
         """Per-topic action card with inline buttons."""
         if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
@@ -985,6 +1051,7 @@ class BridgeBot:
                 effort=resolved.effort,
                 resume=resume,
                 system_prompt=resolved.system_prompt,
+                auto_allow_tools=list(resolved.auto_allow_tools),
                 on_permission_request=perm_handler,
                 on_session_id_assigned=self._make_id_persister(thread_id),
             )

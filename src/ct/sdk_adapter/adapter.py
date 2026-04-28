@@ -142,6 +142,7 @@ class SessionRunner:
         system_prompt: str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        auto_allow_tools: set[str] | None = None,
     ) -> None:
         self.cwd = cwd
         self.permission_mode: PermissionMode = permission_mode
@@ -151,6 +152,10 @@ class SessionRunner:
         self.system_prompt = system_prompt
         self.model = model
         self.effort = effort
+        # Tools the user has pre-trusted bot-wide (or per-profile, when that
+        # plumbing arrives). Same in-memory set as approve-and-remember
+        # populates at runtime — same trust ledger, different seed source.
+        self._initial_auto_allow: set[str] = set(auto_allow_tools or set())
 
         # If we're resuming an existing SDK session, the bridge already knows
         # the id — surface it immediately so callers can rely on it before the
@@ -163,9 +168,11 @@ class SessionRunner:
         # use of the same tool within this session".
         self._pending: dict[str, asyncio.Future[tuple[str, Any, bool]]] = {}
         # Tool names the user has chosen to always-allow for this session.
-        # Cleared on stop; deliberately NOT persisted across runner restarts —
-        # a fresh SDK process means a fresh trust ledger.
-        self._remembered_allows: set[str] = set()
+        # Seeded from `auto_allow_tools` (bot/profile pre-trust list) and
+        # extended at runtime via approve-and-remember. Cleared on stop —
+        # deliberately NOT persisted across runner restarts so a fresh SDK
+        # process gets a fresh trust ledger.
+        self._remembered_allows: set[str] = set(self._initial_auto_allow)
         self._closed = False
 
     # ---- lifecycle ----------------------------------------------------------
