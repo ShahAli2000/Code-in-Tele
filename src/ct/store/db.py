@@ -65,6 +65,7 @@ class MacRow:
     port: int
     added_at: str
     last_connected: str | None
+    main_dir: str | None = None
 
 
 class Db:
@@ -104,6 +105,12 @@ class Db:
         if "effort" not in session_cols:
             await self.conn.execute("ALTER TABLE sessions ADD COLUMN effort TEXT")
             log.info("db.migrated", change="sessions.effort added")
+
+        async with self.conn.execute("PRAGMA table_info(macs)") as cur:
+            mac_cols = {row[1] for row in await cur.fetchall()}
+        if "main_dir" not in mac_cols:
+            await self.conn.execute("ALTER TABLE macs ADD COLUMN main_dir TEXT")
+            log.info("db.migrated", change="macs.main_dir added")
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -356,12 +363,40 @@ class Db:
 
     # ---- macs ---------------------------------------------------------------
 
-    async def insert_mac(self, name: str, host: str, port: int) -> None:
+    async def insert_mac(
+        self, name: str, host: str, port: int, *, main_dir: str | None = None
+    ) -> None:
+        # Preserve existing main_dir if the row already exists and the caller
+        # didn't pass one explicitly.
+        existing = None
+        if main_dir is None:
+            async with self.conn.execute(
+                "SELECT main_dir FROM macs WHERE name = ?", (name,)
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                existing = row[0]
         await self.conn.execute(
-            "INSERT OR REPLACE INTO macs(name, host, port) VALUES (?, ?, ?)",
-            (name, host, port),
+            "INSERT OR REPLACE INTO macs(name, host, port, main_dir) VALUES (?, ?, ?, ?)",
+            (name, host, port, main_dir if main_dir is not None else existing),
         )
         await self.conn.commit()
+
+    async def update_mac_main_dir(self, name: str, main_dir: str | None) -> None:
+        await self.conn.execute(
+            "UPDATE macs SET main_dir = ? WHERE name = ?",
+            (main_dir, name),
+        )
+        await self.conn.commit()
+
+    async def get_mac(self, name: str) -> MacRow | None:
+        async with self.conn.execute(
+            "SELECT name, host, port, added_at, last_connected, main_dir "
+            "FROM macs WHERE name = ?",
+            (name,),
+        ) as cur:
+            row = await cur.fetchone()
+        return MacRow(*row) if row else None
 
     async def remove_mac(self, name: str) -> bool:
         async with self.conn.execute(
@@ -380,7 +415,8 @@ class Db:
 
     async def list_macs(self) -> list[MacRow]:
         async with self.conn.execute(
-            "SELECT name, host, port, added_at, last_connected FROM macs ORDER BY name"
+            "SELECT name, host, port, added_at, last_connected, main_dir "
+            "FROM macs ORDER BY name"
         ) as cur:
             rows = await cur.fetchall()
         return [MacRow(*r) for r in rows]

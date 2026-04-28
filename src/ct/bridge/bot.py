@@ -19,7 +19,12 @@ import structlog
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message, TelegramObject
+from aiogram.types import (
+    CallbackQuery,
+    ForceReply,
+    Message,
+    TelegramObject,
+)
 
 from ct.bridge import menu as menu_ui
 from ct.bridge.permissions_ui import PermissionsUI
@@ -160,6 +165,8 @@ class BridgeBot:
         self.started_at = datetime.now(timezone.utc)
         self.sessions = SessionStore(db)
         self.permissions_ui = PermissionsUI(bot, db)
+        # ForceReply tracking — message_id -> {action, ...} for ad-hoc prompts.
+        self._pending_replies: dict[int, dict[str, Any]] = {}
         self.dp = Dispatcher()
         self._router = Router()
         self._wire_middleware_and_handlers()
@@ -209,6 +216,13 @@ class BridgeBot:
         self._router.message.register(self.cmd_profiles, Command("profiles"))
         self._router.message.register(self.cmd_menu, Command("menu", "m"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
+
+        # Replies to bot ForceReply prompts (browse-flow new-folder, etc.) —
+        # registered BEFORE on_topic_message so a General reply lands here.
+        self._router.message.register(
+            self.on_pending_reply,
+            F.reply_to_message.is_not(None) & F.text.is_not(None),
+        )
 
         self._router.message.register(
             self.on_topic_message,
@@ -266,13 +280,42 @@ class BridgeBot:
             await self._macs_add(message, name, host, port)
         elif parts[1] == "remove" and len(parts) >= 3:
             await self._macs_remove(message, parts[2])
+        elif parts[1] == "config" and len(parts) >= 3:
+            await self._macs_config(message, parts[2:])
         else:
             await message.answer(
                 "usage:\n"
-                "  /macs                       — list registered runners\n"
-                "  /macs add NAME HOST [PORT]  — register a runner over Tailscale\n"
-                "  /macs remove NAME           — drop a runner"
+                "  /macs                                  — list registered runners\n"
+                "  /macs add NAME HOST [PORT]             — register a runner\n"
+                "  /macs remove NAME                      — drop a runner\n"
+                "  /macs config NAME main_dir=<path>      — set the browse root for that mac"
             )
+
+    async def _macs_config(self, message: Message, rest_tokens: list[str]) -> None:
+        if not rest_tokens:
+            await message.answer("usage: /macs config NAME main_dir=<path>")
+            return
+        name = rest_tokens[0]
+        if name not in self.runners.names() and not await self.db.get_mac(name):
+            await message.answer(f"⚠ no mac registered as {name!r}")
+            return
+        new_main_dir: str | None = None
+        for tok in rest_tokens[1:]:
+            if tok.startswith("main_dir="):
+                new_main_dir = tok[len("main_dir="):]
+        if new_main_dir is None:
+            await message.answer(
+                "usage: /macs config NAME main_dir=<path>\n"
+                "(currently the only configurable field)"
+            )
+            return
+        # null/none clears
+        if new_main_dir.lower() in ("null", "none", ""):
+            await self.db.update_mac_main_dir(name, None)
+            await message.answer(f"✓ {name}: main_dir cleared (will use $HOME)")
+        else:
+            await self.db.update_mac_main_dir(name, new_main_dir)
+            await message.answer(f"✓ {name}: main_dir = {new_main_dir}")
 
     async def _macs_list(self, message: Message) -> None:
         names = self.runners.names()
@@ -717,6 +760,7 @@ class BridgeBot:
                     )
                 )
             rows.append(row)
+        rows.append([menu_ui.browse_button()])
         rows.append(
             [
                 InlineKeyboardButton(text="ℹ️ defaults", callback_data="ct:n:show_defaults"),
@@ -774,11 +818,19 @@ class BridgeBot:
     async def _create_session_from_profile(
         self, query: CallbackQuery, profile_name: str
     ) -> None:
-        """Run the same session-creation flow as cmd_new but driven by a button."""
+        """Run the session-creation flow driven by a profile-button tap."""
         args = ParsedArgs(
             name=profile_name, cwd=None, mac=None, model=None, effort=None, mode=None
         )
         resolved = await self._resolve_for_new(args)
+        await self._execute_new_session(resolved, source_label=f"profile: {profile_name}")
+
+    async def _execute_new_session(
+        self, resolved: "ResolvedSession", *, source_label: str = ""
+    ) -> int | None:
+        """Common path: validate runner + cwd, create topic, open session, add
+        to store, post ready card. Returns the new thread_id or None on failure
+        (errors are surfaced via Telegram messages)."""
         cwd = Path(resolved.cwd).expanduser()
         runner_name = resolved.runner_name
 
@@ -787,27 +839,30 @@ class BridgeBot:
         except KeyError:
             await self.bot.send_message(
                 chat_id=self.settings.telegram_chat_id,
-                text=f"⚠ {runner_name!r} runner not registered. use /macs add",
+                text=(
+                    f"⚠ no runner registered as {runner_name!r}. "
+                    f"available: {', '.join(self.runners.names()) or '(none)'}"
+                ),
             )
-            return
+            return None
 
         if runner_name == self.default_runner and not cwd.is_dir():
             await self.bot.send_message(
                 chat_id=self.settings.telegram_chat_id,
-                text=f"⚠ profile {profile_name!r}: dir does not exist on {runner_name}: {cwd}",
+                text=f"⚠ directory does not exist on {runner_name}: {cwd}",
             )
-            return
+            return None
 
         try:
             thread_id = await create_topic(
-                self.bot, self.settings.telegram_chat_id, profile_name
+                self.bot, self.settings.telegram_chat_id, resolved.name
             )
         except TelegramBadRequest as exc:
             await self.bot.send_message(
                 chat_id=self.settings.telegram_chat_id,
                 text=f"⚠ couldn't create topic: {exc!s}",
             )
-            return
+            return None
 
         sid = str(thread_id)
         handle_box: list[SessionHandle] = []
@@ -831,19 +886,19 @@ class BridgeBot:
                 on_session_id_assigned=self._make_id_persister(thread_id),
             )
         except Exception as exc:
-            log.exception("session.open_from_profile_failed", profile=profile_name)
+            log.exception("session.open_failed", name=resolved.name, runner=runner_name)
             await self.bot.send_message(
                 chat_id=self.settings.telegram_chat_id,
                 message_thread_id=thread_id,
                 text=f"⚠ couldn't open session: {exc!s}",
             )
-            return
+            return None
         handle_box.append(handle)
 
         await self.sessions.add(
             TopicSession(
                 thread_id=thread_id,
-                project_name=profile_name,
+                project_name=resolved.name,
                 cwd=str(cwd),
                 runner=handle,
                 turn_lock=asyncio.Lock(),
@@ -852,19 +907,22 @@ class BridgeBot:
                 effort=resolved.effort,
             )
         )
+        suffix = f" ({source_label})" if source_label else ""
         await self.bot.send_message(
             chat_id=self.settings.telegram_chat_id,
             message_thread_id=thread_id,
             text=(
-                f"✓ session ready (from profile: {profile_name})\n"
-                f"cwd:    {cwd}\n"
-                f"runner: {runner_name}\n"
-                f"mode:   {resolved.permission_mode}\n"
-                f"model:  {resolved.model or '(SDK default)'}\n"
-                f"effort: {resolved.effort or '(SDK default)'}\n\n"
+                f"✓ session ready{suffix}\n"
+                f"project: {resolved.name}\n"
+                f"cwd:     {cwd}\n"
+                f"runner:  {runner_name}\n"
+                f"mode:    {resolved.permission_mode}\n"
+                f"model:   {resolved.model or '(SDK default)'}\n"
+                f"effort:  {resolved.effort or '(SDK default)'}\n\n"
                 f"Type a message to start, or /m for buttons."
             ),
         )
+        return thread_id
 
     async def cmd_status(self, message: Message) -> None:
         """Snapshot of bot health: uptime, runner connectivity, active sessions."""
@@ -992,9 +1050,214 @@ class BridgeBot:
             return
         if await menu_ui.handle_profiles_callback(query, db=self.db, bot=self.bot):
             return
+        if await self._handle_browse_callback(query):
+            return
         if await self._handle_new_menu_callback(query):
             return
         await query.answer()
+
+    # ---- folder browser callbacks (ct:b:*) --------------------------------
+
+    async def _handle_browse_callback(self, query: CallbackQuery) -> bool:
+        data = query.data or ""
+        if not data.startswith(menu_ui.BROWSE_PREFIX):
+            return False
+        rest = data[len(menu_ui.BROWSE_PREFIX) :]
+        parts = rest.split(":")
+        verb = parts[0]
+
+        if verb == "back":
+            # Re-render /new menu in place
+            await self._edit_to_new_menu(query)
+            await query.answer()
+            return True
+
+        if verb == "start":
+            names = self.runners.names()
+            if not names:
+                await query.answer("no runners registered", show_alert=True)
+                return True
+            if len(names) == 1:
+                await self._show_browse_listing(query, names[0], show_hidden=False)
+            else:
+                await menu_ui._safe_edit(
+                    self.bot, query,
+                    text="📂 browse — pick a mac:",
+                    keyboard=menu_ui.mac_picker_keyboard(names),
+                )
+                await query.answer()
+            return True
+
+        if verb == "m" and len(parts) >= 2:
+            mac_name = parts[1]
+            show_hidden = (len(parts) >= 3 and parts[2] == "h")
+            await self._show_browse_listing(query, mac_name, show_hidden=show_hidden)
+            return True
+
+        if verb == "o" and len(parts) >= 3:
+            mac_name = parts[1]
+            folder = ":".join(parts[2:])  # rejoin in case folder name had colons (rare)
+            await self._open_session_in_folder(query, mac_name, folder, source="browse")
+            return True
+
+        if verb == "n" and len(parts) >= 2:
+            mac_name = parts[1]
+            await self._prompt_new_folder(query, mac_name)
+            return True
+
+        await query.answer("unknown")
+        return True
+
+    async def _show_browse_listing(
+        self, query: CallbackQuery, mac_name: str, *, show_hidden: bool
+    ) -> None:
+        try:
+            conn = self.runners.get(mac_name)
+        except KeyError:
+            await query.answer(f"runner {mac_name!r} not registered", show_alert=True)
+            return
+        mac_row = await self.db.get_mac(mac_name)
+        main_dir = (mac_row.main_dir if mac_row else None) or "~"
+        try:
+            resolved_path, items = await conn.list_dir(main_dir, show_hidden=show_hidden)
+        except Exception as exc:
+            await menu_ui._safe_edit(
+                self.bot, query,
+                text=f"⚠ couldn't list {mac_name}:{main_dir}\n\n{exc!s}",
+                keyboard=None,
+            )
+            await query.answer()
+            return
+        await menu_ui._safe_edit(
+            self.bot, query,
+            text=menu_ui.folder_picker_text(
+                mac_name, resolved_path, items, show_hidden=show_hidden
+            ),
+            keyboard=menu_ui.folder_picker_keyboard(
+                mac_name, resolved_path, items, show_hidden=show_hidden
+            ),
+        )
+        await query.answer()
+
+    async def _open_session_in_folder(
+        self,
+        query: CallbackQuery,
+        mac_name: str,
+        folder: str,
+        *,
+        source: str,
+    ) -> None:
+        await query.answer(f"opening {folder}…")
+        mac_row = await self.db.get_mac(mac_name)
+        main_dir = (mac_row.main_dir if mac_row else None) or "~"
+        full_path = str(Path(main_dir).expanduser() / folder)
+        # Apply layered defaults — we still go through _resolve_for_new so the
+        # user's chosen model/effort/mode get layered correctly.
+        args = ParsedArgs(
+            name=folder, cwd=full_path, mac=mac_name,
+            model=None, effort=None, mode=None,
+        )
+        resolved = await self._resolve_for_new(args)
+        await self._execute_new_session(resolved, source_label=f"via {source} on {mac_name}")
+        # Edit the browse message away — the new topic has its own ready card
+        await menu_ui._safe_edit(
+            self.bot, query,
+            text=f"✓ opened {mac_name}:{full_path}",
+            keyboard=None,
+        )
+
+    async def _prompt_new_folder(self, query: CallbackQuery, mac_name: str) -> None:
+        mac_row = await self.db.get_mac(mac_name)
+        main_dir = (mac_row.main_dir if mac_row else None) or "~"
+        # Send a ForceReply prompt and remember it
+        sent = await self.bot.send_message(
+            chat_id=self.settings.telegram_chat_id,
+            text=(
+                f"➕ new folder under {mac_name}:{main_dir}\n"
+                f"reply with the folder name (no slashes)"
+            ),
+            reply_markup=ForceReply(selective=True),
+        )
+        self._pending_replies[sent.message_id] = {
+            "action": "new_folder",
+            "mac": mac_name,
+            "main_dir": main_dir,
+        }
+        await query.answer("type a name…")
+
+    async def _edit_to_new_menu(self, query: CallbackQuery) -> None:
+        """Re-render the /new menu inside an existing message (used by 'back')."""
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        profiles = await self.db.list_profiles()
+        rows: list[list[InlineKeyboardButton]] = []
+        for i in range(0, len(profiles), 2):
+            row = []
+            for p in profiles[i : i + 2]:
+                row.append(InlineKeyboardButton(
+                    text=f"📁 {p.name}", callback_data=f"ct:n:p:{p.name}"
+                ))
+            rows.append(row)
+        rows.append([menu_ui.browse_button()])
+        rows.append([
+            InlineKeyboardButton(text="ℹ️ defaults", callback_data="ct:n:show_defaults"),
+            InlineKeyboardButton(text="❓ usage", callback_data="ct:n:usage"),
+        ])
+        text = "🚀 start a new session"
+        await menu_ui._safe_edit(
+            self.bot, query, text=text,
+            keyboard=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    # ---- ForceReply handler -----------------------------------------------
+
+    async def on_pending_reply(self, message: Message) -> None:
+        """Catches all text replies. If the parent message_id matches a
+        ForceReply prompt the bot sent, handle it. Otherwise fall through
+        to on_topic_message so normal topic conversation isn't swallowed."""
+        if message.reply_to_message is None:
+            return
+        parent_id = message.reply_to_message.message_id
+        pending = self._pending_replies.pop(parent_id, None)
+        if pending is None:
+            # Not one of our prompts — manually delegate so topic replies
+            # still flow into Claude (aiogram's first-match routing would
+            # otherwise stop here).
+            await self.on_topic_message(message)
+            return
+        action = pending.get("action")
+        if action == "new_folder":
+            await self._handle_new_folder_reply(message, pending)
+
+    async def _handle_new_folder_reply(
+        self, message: Message, pending: dict[str, Any]
+    ) -> None:
+        mac_name = pending["mac"]
+        main_dir = pending["main_dir"]
+        folder_name = (message.text or "").strip()
+        if not folder_name or "/" in folder_name or folder_name in (".", ".."):
+            await message.answer("⚠ folder name can't be empty, contain '/', or be '.' / '..'")
+            return
+        try:
+            conn = self.runners.get(mac_name)
+        except KeyError:
+            await message.answer(f"⚠ runner {mac_name!r} no longer registered")
+            return
+        full_path = str(Path(main_dir).expanduser() / folder_name)
+        try:
+            await conn.mkdir(full_path)
+        except RuntimeError as exc:
+            await message.answer(f"⚠ couldn't create {folder_name}: {exc!s}")
+            return
+        # Now open a session there
+        args = ParsedArgs(
+            name=folder_name, cwd=full_path, mac=mac_name,
+            model=None, effort=None, mode=None,
+        )
+        resolved = await self._resolve_for_new(args)
+        await self._execute_new_session(
+            resolved, source_label=f"via browse on {mac_name} (new folder)"
+        )
 
     async def _close_session_via_menu(self, session: TopicSession) -> None:
         """Called by the action card's close button."""

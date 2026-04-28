@@ -515,3 +515,82 @@ async def handle_profiles_callback(query: CallbackQuery, *, db, bot: Bot) -> boo
         return True
     await query.answer("unknown")
     return True
+
+
+# ====== folder browser (ct:b:*) =========================================
+
+BROWSE_PREFIX = "ct:b:"
+
+
+def browse_button() -> InlineKeyboardButton:
+    return InlineKeyboardButton(text="📂 browse", callback_data=BROWSE_PREFIX + "start")
+
+
+def mac_picker_keyboard(mac_names: list[str]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    # Two macs per row
+    for i in range(0, len(mac_names), 2):
+        rows.append([
+            InlineKeyboardButton(
+                text=f"👤 {n}", callback_data=BROWSE_PREFIX + f"m:{n}"
+            )
+            for n in mac_names[i : i + 2]
+        ])
+    rows.append([InlineKeyboardButton(text="← back", callback_data="ct:n:back_to_root")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def folder_picker_keyboard(
+    mac_name: str,
+    main_dir: str,
+    items: list[tuple[str, bool]],
+    *,
+    show_hidden: bool,
+) -> InlineKeyboardMarkup:
+    """Build a folder-picker keyboard. Only directory items are tappable as
+    "open here" — files are listed but not actionable."""
+    rows: list[list[InlineKeyboardButton]] = []
+    # Cap at ~30 dirs, paginate later if needed
+    folder_items = [(n, is_dir) for n, is_dir in items if is_dir][:30]
+    for i in range(0, len(folder_items), 2):
+        row = []
+        for n, _ in folder_items[i : i + 2]:
+            row.append(
+                InlineKeyboardButton(
+                    text=f"📁 {n}",
+                    callback_data=BROWSE_PREFIX + f"o:{mac_name}:{n}",
+                )
+            )
+        rows.append(row)
+    # Extras
+    rows.append([
+        InlineKeyboardButton(
+            text="➕ new folder",
+            callback_data=BROWSE_PREFIX + f"n:{mac_name}",
+        ),
+        InlineKeyboardButton(
+            text=("👁‍🗨 hide hidden" if show_hidden else "👁 show hidden"),
+            callback_data=BROWSE_PREFIX + f"m:{mac_name}:{'noh' if show_hidden else 'h'}",
+        ),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="← back", callback_data=BROWSE_PREFIX + "back"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def folder_picker_text(
+    mac_name: str, main_dir: str, items: list[tuple[str, bool]], *, show_hidden: bool
+) -> str:
+    n_dirs = sum(1 for _, is_dir in items if is_dir)
+    n_files = sum(1 for _, is_dir in items if not is_dir)
+    file_summary = ""
+    if n_files > 0:
+        file_names = [n for n, is_dir in items if not is_dir][:8]
+        file_summary = f"\n(also {n_files} non-folder entries: {', '.join(file_names[:5])}{'…' if len(file_names) > 5 else ''})"
+    suffix = "  ·  hidden visible" if show_hidden else ""
+    return (
+        f"📂 {mac_name}:{main_dir}{suffix}\n"
+        f"{n_dirs} folder(s)\n{file_summary}\n"
+        f"\ntap a folder to open a session there, or ➕ to create a new one."
+    )

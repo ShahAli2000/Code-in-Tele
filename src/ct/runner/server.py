@@ -32,6 +32,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import pathlib
 import signal
 import sys
 from collections.abc import AsyncIterator
@@ -60,8 +61,12 @@ from ct.protocol.envelopes import (
     T_CLOSE,
     T_CLOSED,
     T_DECIDE,
+    T_DIR_LISTING,
     T_ERROR,
     T_INTERRUPT,
+    T_LIST_DIR,
+    T_MKDIR,
+    T_MKDIR_OK,
     T_OPEN,
     T_OPENED,
     T_PERMISSION_REQUEST,
@@ -77,7 +82,9 @@ from ct.protocol.envelopes import (
     T_TOOL_USE,
     T_TURN_END,
     closed_payload,
+    dir_listing_payload,
     error_payload,
+    mkdir_ok_payload,
     permission_request_payload,
     sdk_id_payload,
     system_payload,
@@ -250,6 +257,10 @@ class RunnerConnection:
                 await self._handle_close(env)
             elif env.type == T_PING:
                 await self._send(Envelope(T_PONG, env.id, {}))
+            elif env.type == T_LIST_DIR:
+                await self._handle_list_dir(env)
+            elif env.type == T_MKDIR:
+                await self._handle_mkdir(env)
             else:
                 await self._send_error(env.id, "unsupported_type", env.type)
         except Exception as exc:
@@ -399,6 +410,70 @@ class RunnerConnection:
         if session is None or session.runner is None:
             return
         await session.runner.interrupt()
+
+    # ---- connection-level RPCs (no session) ---------------------------------
+
+    # Subdirs that are noise 99% of the time. The bridge's "show hidden" toggle
+    # bypasses this filter (it still hides dotfiles in that mode? actually,
+    # show_hidden = show *everything*; we make it the user's call).
+    _DEFAULT_SKIP_NAMES = frozenset({
+        ".venv", "venv", "node_modules", "__pycache__", ".git",
+        ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "dist", "build",
+        ".idea", ".vscode", ".DS_Store",
+    })
+
+    async def _handle_list_dir(self, env: Envelope) -> None:
+        path_raw = env.payload.get("path")
+        show_hidden = bool(env.payload.get("show_hidden", False))
+        if not isinstance(path_raw, str) or not path_raw:
+            await self._send_error(env.id, "bad_request", "list_dir.path required")
+            return
+        path = pathlib.Path(path_raw).expanduser()
+        try:
+            if not path.is_dir():
+                await self._send_error(env.id, "not_a_dir", str(path))
+                return
+            items: list[dict[str, Any]] = []
+            for entry in sorted(path.iterdir(), key=lambda p: p.name.lower()):
+                name = entry.name
+                if not show_hidden:
+                    if name.startswith("."):
+                        continue
+                    if name in self._DEFAULT_SKIP_NAMES:
+                        continue
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    is_dir = False
+                items.append({"name": name, "is_dir": is_dir})
+        except PermissionError as exc:
+            await self._send_error(env.id, "permission_denied", str(exc))
+            return
+        except OSError as exc:
+            await self._send_error(env.id, "io_error", str(exc))
+            return
+        await self._send(
+            Envelope(T_DIR_LISTING, env.id, dir_listing_payload(str(path), items))
+        )
+
+    async def _handle_mkdir(self, env: Envelope) -> None:
+        path_raw = env.payload.get("path")
+        if not isinstance(path_raw, str) or not path_raw:
+            await self._send_error(env.id, "bad_request", "mkdir.path required")
+            return
+        path = pathlib.Path(path_raw).expanduser()
+        try:
+            path.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            await self._send_error(env.id, "exists", str(path))
+            return
+        except PermissionError as exc:
+            await self._send_error(env.id, "permission_denied", str(exc))
+            return
+        except OSError as exc:
+            await self._send_error(env.id, "io_error", str(exc))
+            return
+        await self._send(Envelope(T_MKDIR_OK, env.id, mkdir_ok_payload(str(path))))
 
     async def _handle_close(self, env: Envelope) -> None:
         session = self.sessions.pop(env.id, None)

@@ -83,11 +83,17 @@ async def _run() -> int:
             f"couldn't reach runner at {settings.runner_host}:{settings.runner_port} — "
             f"is the runner LaunchAgent loaded? ({exc!r})"
         ) from exc
+    # Make sure studio has a row in the macs table so its main_dir lives in
+    # the same place as remote macs (and /macs commands list it uniformly).
+    await db.insert_mac("studio", settings.runner_host, settings.runner_port)
 
     # Reconnect every previously-registered remote mac. Failures here are
     # warnings, not fatal — a mac being asleep shouldn't block the bridge.
+    # Skip 'studio' since it's added above as the local loopback runner.
     log_main = structlog.get_logger("ct.bridge.main")
     for mac in await db.list_macs():
+        if mac.name == "studio":
+            continue
         try:
             await runners.add_runner(
                 name=mac.name, host=mac.host, port=mac.port,

@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS macs (
     name             TEXT    PRIMARY KEY,
     host             TEXT    NOT NULL,
     port             INTEGER NOT NULL,
+    main_dir         TEXT,                          -- null = use $HOME on the runner
     added_at         TEXT    NOT NULL DEFAULT (datetime('now')),
     last_connected   TEXT
 );
@@ -66,7 +67,7 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
-INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '5');
+INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '6');
 
 -- Default seeds for bot-wide defaults (used when a profile + /new override
 -- don't specify the field). NULL means SDK default.

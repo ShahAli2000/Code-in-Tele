@@ -44,8 +44,10 @@ T_PONG = "pong"               # heartbeat reply
 ALL_TYPES: frozenset[str] = frozenset({
     T_OPEN, T_SEND, T_DECIDE, T_SET_MODE, T_INTERRUPT, T_CLOSE, T_PING,
     "set_model",
+    "list_dir", "mkdir",
     T_OPENED, T_SDK_ID, T_TEXT, T_TOOL_USE, T_TOOL_RESULT, T_THINKING,
     T_SYSTEM, T_PERMISSION_REQUEST, T_TURN_END, T_CLOSED, T_ERROR, T_PONG,
+    "dir_listing", "mkdir_ok",
 })
 
 
@@ -135,6 +137,31 @@ T_SET_MODEL = "set_model"
 
 def set_model_payload(model: str) -> dict[str, Any]:
     return {"model": model}
+
+
+# Connection-level RPCs (not session-scoped). The bridge uses Envelope.id as a
+# request_id (not a session_id) and the runner echoes it on the reply so the
+# bridge can correlate. Phase 7 introduces these for the folder-picker UX.
+T_LIST_DIR = "list_dir"            # bridge → runner: payload {path, show_hidden}
+T_DIR_LISTING = "dir_listing"      # runner → bridge: payload {path, items: [{name, is_dir}]}
+T_MKDIR = "mkdir"                  # bridge → runner: payload {path}
+T_MKDIR_OK = "mkdir_ok"            # runner → bridge: payload {path}
+
+
+def list_dir_payload(path: str, show_hidden: bool = False) -> dict[str, Any]:
+    return {"path": path, "show_hidden": show_hidden}
+
+
+def dir_listing_payload(path: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"path": path, "items": items}
+
+
+def mkdir_payload(path: str) -> dict[str, Any]:
+    return {"path": path}
+
+
+def mkdir_ok_payload(path: str) -> dict[str, Any]:
+    return {"path": path}
 
 
 def send_payload(text: str) -> dict[str, Any]:

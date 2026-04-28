@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 
@@ -44,8 +45,12 @@ from ct.protocol.envelopes import (
     T_CLOSE,
     T_CLOSED,
     T_DECIDE,
+    T_DIR_LISTING,
     T_ERROR,
     T_INTERRUPT,
+    T_LIST_DIR,
+    T_MKDIR,
+    T_MKDIR_OK,
     T_OPEN,
     T_OPENED,
     T_PERMISSION_REQUEST,
@@ -59,6 +64,8 @@ from ct.protocol.envelopes import (
     T_TOOL_USE,
     T_TURN_END,
     decide_payload,
+    list_dir_payload,
+    mkdir_payload,
     open_payload,
     send_payload,
     set_mode_payload,
@@ -228,6 +235,8 @@ class RunnerConnection:
         self._reader_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
         self._sessions: dict[str, _SessionState] = {}
+        # Connection-level RPCs (list_dir, mkdir): request_id -> future for the reply.
+        self._pending_calls: dict[str, asyncio.Future[Envelope]] = {}
         self._send_lock = asyncio.Lock()
         self._auto_reconnect = True
 
@@ -313,6 +322,13 @@ class RunnerConnection:
                      "message": f"runner {self.name!r} dropped — will reconnect"},
                 )
                 state.turn_queue.put_nowait(err)
+        # Fail any in-flight RPCs (list_dir/mkdir) so callers don't hang.
+        for fut in list(self._pending_calls.values()):
+            if not fut.done():
+                fut.set_exception(
+                    RuntimeError(f"runner {self.name!r} disconnected mid-RPC")
+                )
+        self._pending_calls.clear()
         if self._auto_reconnect and self._reconnect_task is None:
             self._reconnect_task = asyncio.create_task(
                 self._reconnect_loop(), name=f"runner-reconnect-{self.name}"
@@ -395,6 +411,14 @@ class RunnerConnection:
         return reopened
 
     async def _dispatch(self, env: Envelope) -> None:
+        # Connection-level RPC replies arrive with env.id = request_id, not a
+        # session id. Dispatch those first.
+        if env.id in self._pending_calls:
+            fut = self._pending_calls.pop(env.id)
+            if not fut.done():
+                fut.set_result(env)
+            return
+
         state = self._sessions.get(env.id)
         if state is None:
             log.debug("runner_client.event_for_unknown_session", sid=env.id, type=env.type)
@@ -460,6 +484,58 @@ class RunnerConnection:
         line = frame(env, self.secret)
         async with self._send_lock:
             await self._ws.send(line)
+
+    # ---- connection-level RPCs (no session) --------------------------------
+
+    async def _call_rpc(
+        self, env_type: str, payload: dict, *, timeout: float = 10.0
+    ) -> Envelope:
+        """Send an RPC envelope, await the reply correlated by id. Reply may be
+        the success type (e.g. T_DIR_LISTING) or T_ERROR."""
+        request_id = uuid.uuid4().hex[:16]
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Envelope] = loop.create_future()
+        self._pending_calls[request_id] = fut
+        try:
+            await self._send(Envelope(env_type, request_id, payload))
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending_calls.pop(request_id, None)
+            raise
+        finally:
+            self._pending_calls.pop(request_id, None)
+
+    async def list_dir(
+        self, path: str, *, show_hidden: bool = False
+    ) -> tuple[str, list[tuple[str, bool]]]:
+        """List subdirs/files under `path` on the runner. Returns (resolved_path,
+        items) where items are (name, is_dir). Hidden + venv/etc. filtered out
+        unless show_hidden=True."""
+        env = await self._call_rpc(
+            T_LIST_DIR, list_dir_payload(path, show_hidden)
+        )
+        if env.type == T_ERROR:
+            raise RuntimeError(
+                f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
+            )
+        if env.type != T_DIR_LISTING:
+            raise RuntimeError(f"unexpected reply type: {env.type}")
+        items = [
+            (item["name"], bool(item.get("is_dir", False)))
+            for item in env.payload.get("items", [])
+            if isinstance(item, dict) and "name" in item
+        ]
+        return env.payload.get("path", path), items
+
+    async def mkdir(self, path: str) -> str:
+        """Create a directory (mkdir -p) on the runner. Returns the resolved
+        absolute path. Raises if it already exists or is denied."""
+        env = await self._call_rpc(T_MKDIR, mkdir_payload(path))
+        if env.type == T_ERROR:
+            raise RuntimeError(
+                f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
+            )
+        return env.payload.get("path", path)
 
     async def open_session(
         self,
