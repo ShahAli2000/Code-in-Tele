@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import aiosqlite
 import structlog
@@ -386,6 +386,92 @@ class Db:
         out: dict[str, str | None] = {}
         for k in self.DEFAULT_KEYS:
             out[k] = await self.get_default(k)
+        return out
+
+    # ---- message_log (lightweight observability) ---------------------------
+
+    async def log_event(
+        self, thread_id: int, kind: str, payload: dict | None = None
+    ) -> None:
+        """Append an event to message_log. Fire-and-forget; failures are
+        logged but never raised — observability shouldn't ever break the
+        actual session flow."""
+        import json as _json
+        body = None
+        if payload is not None:
+            try:
+                body = _json.dumps(payload, default=str, ensure_ascii=False)[:2048]
+            except (TypeError, ValueError):
+                body = repr(payload)[:2048]
+        try:
+            await self.conn.execute(
+                "INSERT INTO message_log(thread_id, kind, payload) VALUES (?, ?, ?)",
+                (thread_id, kind, body),
+            )
+            await self.conn.commit()
+        except Exception:
+            log.exception("message_log.insert_failed", thread_id=thread_id, kind=kind)
+
+    async def stats_overview(self) -> dict[str, Any]:
+        """Aggregate message_log for /stats. Returns:
+            {
+                "total_events": int,
+                "by_kind": {kind: count, ...},
+                "top_tools": [(name, count), ...],   # at most 10
+                "by_session": [(thread_id, total, last_ts), ...],
+                "recent_24h": int,
+            }"""
+        import json as _json
+        out: dict[str, Any] = {
+            "total_events": 0,
+            "by_kind": {},
+            "top_tools": [],
+            "by_session": [],
+            "recent_24h": 0,
+        }
+        async with self.conn.execute("SELECT COUNT(*) FROM message_log") as cur:
+            row = await cur.fetchone()
+            out["total_events"] = int(row[0]) if row else 0
+        if out["total_events"] == 0:
+            return out
+        async with self.conn.execute(
+            "SELECT kind, COUNT(*) FROM message_log GROUP BY kind"
+        ) as cur:
+            for k, c in await cur.fetchall():
+                out["by_kind"][k] = c
+        async with self.conn.execute(
+            "SELECT COUNT(*) FROM message_log "
+            "WHERE ts >= datetime('now', '-1 day')"
+        ) as cur:
+            row = await cur.fetchone()
+            out["recent_24h"] = int(row[0]) if row else 0
+
+        # Tool usage: parse payload JSON for kind=tool_use
+        tool_counts: dict[str, int] = {}
+        async with self.conn.execute(
+            "SELECT payload FROM message_log WHERE kind = 'tool_use'"
+        ) as cur:
+            async for (payload,) in cur:
+                if not payload:
+                    continue
+                try:
+                    p = _json.loads(payload)
+                except Exception:
+                    continue
+                name = p.get("name") if isinstance(p, dict) else None
+                if isinstance(name, str) and name:
+                    tool_counts[name] = tool_counts.get(name, 0) + 1
+        out["top_tools"] = sorted(
+            tool_counts.items(), key=lambda kv: kv[1], reverse=True
+        )[:10]
+
+        # Per-session: total events + last activity
+        async with self.conn.execute(
+            "SELECT thread_id, COUNT(*), MAX(ts) FROM message_log "
+            "GROUP BY thread_id ORDER BY MAX(ts) DESC LIMIT 20"
+        ) as cur:
+            for tid, n, ts in await cur.fetchall():
+                out["by_session"].append((int(tid), int(n), str(ts)))
         return out
 
     # ---- macs ---------------------------------------------------------------

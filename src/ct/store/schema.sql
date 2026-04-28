@@ -61,13 +61,28 @@ CREATE TABLE IF NOT EXISTS macs (
     last_connected   TEXT
 );
 
+-- Bounded log of bridge-observable session events. Used by /stats and for
+-- ad-hoc debugging — NOT a transcript replacement (the SDK's .jsonl on disk
+-- is the source of truth for that). Pruning happens lazily via /stats; left
+-- unbounded for now since 500 events/session × 100 sessions is trivial.
+CREATE TABLE IF NOT EXISTS message_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id   INTEGER NOT NULL,
+    kind        TEXT    NOT NULL,  -- user_msg | assistant_text | tool_use | tool_result | turn_end
+    payload     TEXT,                -- JSON, truncated to ~2KB
+    ts          TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_log_thread_ts ON message_log(thread_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_message_log_kind_ts ON message_log(kind, ts);
+
 -- schema_version: a tiny key-value table so future migrations have a foothold.
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 
-INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '6');
+INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '7');
 
 -- Default seeds for bot-wide defaults (used when a profile + /new override
 -- don't specify the field). NULL means SDK default.

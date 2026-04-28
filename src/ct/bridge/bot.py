@@ -244,6 +244,7 @@ class BridgeBot:
         self._router.message.register(self.cmd_get, Command("get"))
         self._router.message.register(self.cmd_quiet, Command("quiet"))
         self._router.message.register(self.cmd_search, Command("search"))
+        self._router.message.register(self.cmd_stats, Command("stats"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
 
         # Single text-message handler. Dispatches:
@@ -295,6 +296,7 @@ class BridgeBot:
             "  /get <path>          — download a file from this session's runner\n"
             "  /quiet [HH:MM HH:MM] — silence non-permission pings during a window\n"
             "  /search <pattern>    — substring search across all past transcripts\n"
+            "  /stats               — turns, tool use, active sessions (from message_log)\n"
             "  /macs [add|remove]   — manage registered runners\n"
             "  /status              — uptime, runners, sessions\n\n"
             "Just type in a topic to talk to Claude.\n"
@@ -1100,6 +1102,53 @@ class BridgeBot:
             "current: /quiet"
         )
 
+    async def cmd_stats(self, message: Message) -> None:
+        """Aggregate counts from message_log: turns, top tools, per-session
+        activity. Empty if message_log was added recently and no turns have
+        run since."""
+        s = await self.db.stats_overview()
+        if s["total_events"] == 0:
+            await message.answer(
+                "📊 stats\n\n"
+                "no events logged yet. message_log fills as turns run."
+            )
+            return
+        lines = [
+            "📊 stats",
+            f"total events:  {s['total_events']:,}",
+            f"last 24h:      {s['recent_24h']:,}",
+            "",
+            "by kind:",
+        ]
+        # Stable order so the eye lands on the same row each time
+        kind_order = ["user_msg", "assistant_text", "tool_use", "tool_result", "turn_end"]
+        for k in kind_order:
+            if k in s["by_kind"]:
+                lines.append(f"  {k:<16} {s['by_kind'][k]:,}")
+        # Anything else
+        for k, v in s["by_kind"].items():
+            if k not in kind_order:
+                lines.append(f"  {k:<16} {v:,}")
+
+        if s["top_tools"]:
+            lines.append("")
+            lines.append("top tools:")
+            for name, count in s["top_tools"]:
+                lines.append(f"  {name:<20} {count:,}")
+
+        if s["by_session"]:
+            lines.append("")
+            lines.append("most active sessions:")
+            # Resolve thread_id → project_name when known
+            for tid, count, ts in s["by_session"][:10]:
+                topic = self.sessions.get(tid)
+                tag = f"{topic.project_name}" if topic else f"thread:{tid}"
+                # Trim ts to "YYYY-MM-DD HH:MM" for screen real estate
+                ts_short = ts[:16] if isinstance(ts, str) else "?"
+                lines.append(f"  {tag:<24} {count:>5}  last: {ts_short}")
+
+        await message.answer("\n".join(lines))
+
     async def cmd_status(self, message: Message) -> None:
         """Snapshot of bot health: uptime, runner connectivity, active sessions."""
         now = datetime.now(timezone.utc)
@@ -1701,15 +1750,25 @@ class BridgeBot:
             self.bot, self.settings.telegram_chat_id, thread_id,
             silent=self._is_quiet_now,
         )
+        await self.db.log_event(
+            thread_id, "user_msg",
+            {"kind": "media", "preview": prompt[:120]},
+        )
         async with session.turn_lock:
             try:
                 async for env in session.runner.turn(prompt):
-                    await self._dispatch_envelope(env, renderer)
+                    await self._dispatch_envelope(env, renderer, thread_id)
             except Exception as exc:
                 log.exception("media.turn_failed", thread_id=thread_id)
                 await renderer.render_error(f"turn failed: {exc!r}")
+                await self.db.log_event(
+                    thread_id, "turn_end", {"reason": "error"},
+                )
             else:
                 await self.sessions.touch(thread_id)
+                await self.db.log_event(
+                    thread_id, "turn_end", {"reason": "success"},
+                )
 
     async def on_topic_message(self, message: Message) -> None:
         thread_id = message.message_thread_id
@@ -1727,30 +1786,55 @@ class BridgeBot:
             self.bot, self.settings.telegram_chat_id, thread_id,
             silent=self._is_quiet_now,
         )
+        # Log the user's turn-opening message — first event of every turn.
+        await self.db.log_event(
+            thread_id, "user_msg",
+            {"len": len(message.text), "preview": message.text[:120]},
+        )
         async with session.turn_lock:
             try:
                 async for env in session.runner.turn(message.text):
-                    await self._dispatch_envelope(env, renderer)
+                    await self._dispatch_envelope(env, renderer, thread_id)
             except Exception as exc:
                 log.exception("turn.failed", thread_id=thread_id)
                 await renderer.render_error(f"turn failed: {exc!r}")
+                await self.db.log_event(
+                    thread_id, "turn_end", {"reason": "error"},
+                )
             else:
                 await self.sessions.touch(thread_id)
+                await self.db.log_event(
+                    thread_id, "turn_end", {"reason": "success"},
+                )
 
-    async def _dispatch_envelope(self, env: Envelope, renderer: TopicRenderer) -> None:
+    async def _dispatch_envelope(
+        self, env: Envelope, renderer: TopicRenderer, thread_id: int | None = None
+    ) -> None:
         if env.type == T_TEXT:
             text = env.payload.get("text", "")
             if text and isinstance(text, str) and text.strip():
                 await renderer.render_text(text)
+                if thread_id is not None:
+                    await self.db.log_event(
+                        thread_id, "assistant_text",
+                        {"len": len(text), "preview": text[:120]},
+                    )
         elif env.type == T_TOOL_USE:
             await renderer.render_tool_use(
                 env.payload.get("name", ""), env.payload.get("input", {}) or {}
             )
+            if thread_id is not None:
+                await self.db.log_event(
+                    thread_id, "tool_use",
+                    {"name": env.payload.get("name", "")},
+                )
         elif env.type == T_TOOL_RESULT:
-            await renderer.render_tool_result(
-                env.payload.get("content", ""),
-                bool(env.payload.get("is_error", False)),
-            )
+            is_error = bool(env.payload.get("is_error", False))
+            await renderer.render_tool_result(env.payload.get("content", ""), is_error)
+            if thread_id is not None:
+                await self.db.log_event(
+                    thread_id, "tool_result", {"is_error": is_error},
+                )
         elif env.type == T_THINKING:
             await renderer.render_thinking()
         elif env.type == T_SYSTEM:

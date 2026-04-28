@@ -44,6 +44,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="get",         description="Download a file from the runner (/get <path>)"),
     BotCommand(command="quiet",       description="Set quiet hours (silent notifications window)"),
     BotCommand(command="search",      description="Search past transcripts (/search <pattern>)"),
+    BotCommand(command="stats",       description="Activity stats: turns, top tools, per-session"),
     BotCommand(command="save",        description="Save a project profile"),
     BotCommand(command="profiles",    description="List saved profiles"),
     BotCommand(command="defaults",    description="Show or set bot-wide defaults"),
