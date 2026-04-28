@@ -161,16 +161,19 @@ class TopicRenderer:
         await self._send(text)
 
     async def render_tool_use(self, tool_name: str, input_data: dict[str, Any]) -> None:
-        # Large Edit/Write payloads turn into a unified-diff document attachment
-        # so the user sees the actual change instead of a truncated head/tail.
+        # Edit gets a unified diff regardless of size — the format is the same
+        # one a programmer reads in a PR, and small edits read just as well
+        # (often better) than the side-by-side old/new chunks. Above the
+        # inline limit we spill the diff to a document attachment.
         if tool_name == "Edit":
             old = input_data.get("old_string", "") or ""
             new = input_data.get("new_string", "") or ""
+            path = input_data.get("file_path", "") or "file"
             if len(old) > DIFF_INLINE_LIMIT or len(new) > DIFF_INLINE_LIMIT:
-                await self._render_edit_as_diff(
-                    input_data.get("file_path", "") or "file", old, new
-                )
+                await self._render_edit_as_diff(path, old, new)
                 return
+            await self._render_edit_inline_diff(path, old, new)
+            return
         if tool_name == "Write":
             content = input_data.get("content", "") or ""
             if len(content) > DIFF_INLINE_LIMIT:
@@ -180,6 +183,19 @@ class TopicRenderer:
                 return
         summary = _format_input_summary(tool_name, input_data)
         await self._send(f"🔧 {tool_name}\n\n{summary}")
+
+    async def _render_edit_inline_diff(self, path: str, old: str, new: str) -> None:
+        """Inline unified diff for small Edit operations — same format as
+        `git diff`, just kept in chat. Falls back to the simple chunk-based
+        view when the diff would be larger than the chunks (rare; happens for
+        very small edits where header overhead dominates)."""
+        diff = _build_unified_diff(path, old, new)
+        if not diff.strip():
+            await self._send(f"🔧 Edit\n\n{path}\n(no textual change)")
+            return
+        added, removed = _diff_changed_lines(old, new)
+        body = f"🔧 Edit  {path}\n+{added}/-{removed} lines\n\n{diff}"
+        await self._send(body)
 
     async def _render_edit_as_diff(self, path: str, old: str, new: str) -> None:
         added, removed = _diff_changed_lines(old, new)

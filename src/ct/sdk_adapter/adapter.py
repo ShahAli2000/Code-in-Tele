@@ -45,6 +45,8 @@ from claude_agent_sdk import (
     ToolPermissionContext,
 )
 
+from ct.sdk_adapter.tools import build_mcp_server
+
 log = structlog.get_logger(__name__)
 
 PermissionMode = Literal[
@@ -80,6 +82,19 @@ mention of git.
 # meaningful Edit/Write changes. Heuristic-only — Claude inspects the project
 # to figure out the right runner; if there's no test infrastructure, this
 # directive is a no-op.
+SVG_TOOL_DIRECTIVE = """
+SVG→PNG rendering:
+- A custom `svg_to_png` tool is registered for this session (visible as \
+`mcp__ct__svg_to_png`). Use it when you've generated an SVG and the user \
+wants a PNG — pass either `svg_path` (a file you wrote) or `svg_content` \
+(inline string) plus `png_path`. Optional `width` / `height` set the \
+output size; otherwise the SVG's intrinsic size is used.
+- The tool wraps `rsvg-convert`. If it isn't installed on the runner, the \
+tool returns a clear error pointing at `brew install librsvg`. Don't fall \
+back to writing a Bash pipeline yourself unless that error appears.
+"""
+
+
 TEST_WORKFLOW_DIRECTIVE = """
 Test workflow for this session:
 - After non-trivial Edit/Write changes, look for a project test runner and \
@@ -170,7 +185,11 @@ class SessionRunner:
         # text). Using SystemPromptPreset rather than a plain string preserves
         # Claude Code's full default behaviour — tool descriptions, planning
         # heuristics, formatting guidance, etc.
-        append_parts: list[str] = [GIT_WORKFLOW_DIRECTIVE, TEST_WORKFLOW_DIRECTIVE]
+        append_parts: list[str] = [
+            GIT_WORKFLOW_DIRECTIVE,
+            TEST_WORKFLOW_DIRECTIVE,
+            SVG_TOOL_DIRECTIVE,
+        ]
         if self.system_prompt:
             append_parts.append(self.system_prompt)
         sdk_system_prompt: Any = {
@@ -188,6 +207,10 @@ class SessionRunner:
             # bridge inherits the user's `defaultMode`, hook bindings, plugin
             # allow rules, etc., which silently override our permission_mode.
             setting_sources=[],
+            # Custom in-process tools (svg_to_png, etc.). Surfaced to Claude
+            # under the `mcp__ct__<tool>` namespace. The MCP server is cheap
+            # to rebuild per-session.
+            mcp_servers={"ct": build_mcp_server()},
             # Dummy PreToolUse hook is REQUIRED for can_use_tool to fire in Python:
             # without it, the SDK closes the stream before the permission callback
             # can be invoked. Documented at docs.claude.com/en/agent-sdk/user-input.
