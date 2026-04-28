@@ -46,7 +46,9 @@ async def svg_to_png(args: dict[str, Any]) -> dict[str, Any]:
                 "type": "text",
                 "text": (
                     "rsvg-convert not found on this runner.\n"
-                    "Install it once: `brew install librsvg`.\n"
+                    "Install once: `brew install librsvg` (macOS), "
+                    "`sudo apt install librsvg2-bin` (Debian/Ubuntu), or "
+                    "`sudo dnf install librsvg2-tools` (Fedora).\n"
                     "After install, the tool works without restart."
                 ),
             }],

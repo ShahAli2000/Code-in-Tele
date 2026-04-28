@@ -1,11 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  LaunchAgent template for the Claude–Telegram bridge.
-
-  install.sh substitutes:
-    {{HOME}}        — $HOME of the runtime user (e.g. /Users/ali)
-    {{PROJECT_DIR}} — full path to the Claude-Telegram repo
-    {{LABEL}}       — reverse-DNS-style identifier (e.g. uk.shahrestani.ct-bridge)
+  LaunchAgent template for the Code-in-Tele bridge. install.sh substitutes:
+    {{HOME}}        — $HOME of the runtime user
+    {{PROJECT_DIR}} — full path to the Code-in-Tele repo on this Mac
+    {{LABEL}}       — short identifier (e.g. ct-bridge)
+    {{UV_PATH}}     — absolute path to the uv binary
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

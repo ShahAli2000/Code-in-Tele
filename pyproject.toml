@@ -1,11 +1,10 @@
 [project]
-name = "claude-telegram-bridge"
-version = "0.0.1"
-description = "Bridge Claude Code (Anthropic Agent SDK) to Telegram via a forum-topic supergroup"
+name = "code-in-tele"
+version = "0.1.0"
+description = "Use Claude Code from Telegram. Each project = a forum topic in a supergroup; multi-Mac/Linux fleet over Tailscale."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-authors = [{ name = "ali" }]
 dependencies = [
     "claude-agent-sdk>=0.1.68",
     "aiogram>=3.10",

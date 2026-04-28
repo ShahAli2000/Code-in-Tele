@@ -57,7 +57,8 @@ class TunnelManager:
         binary = shutil.which("cloudflared")
         if binary is None:
             raise RuntimeError(
-                "cloudflared not installed. brew install cloudflared, then retry."
+                "cloudflared not installed. macOS: `brew install cloudflared`. "
+                "Linux: see https://pkg.cloudflare.com/. Then retry."
             )
         # All args come from typed parameters and are passed as a list — no
         # shell interpretation, no injection surface.

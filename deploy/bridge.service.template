@@ -1,0 +1,23 @@
+# systemd user-unit template for the bridge. See runner.service.template for
+# placeholder substitutions. The bridge polls Telegram so it doesn't need to
+# bind to a tailnet IP unless you also want the dashboard exposed —
+# CT_DASHBOARD_HOST in .env controls that, and the bridge auto-detects the
+# tailnet IP via `tailscale ip -4` when CT_DASHBOARD_HOST is unset.
+[Unit]
+Description=Code-in-Tele bridge ({{LABEL}})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={{UV_PATH}} run --project {{PROJECT_DIR}} python -m ct.bridge.main
+WorkingDirectory={{PROJECT_DIR}}
+Restart=always
+RestartSec=10
+Environment=PATH={{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME={{HOME}}
+StandardOutput=append:{{PROJECT_DIR}}/state/bridge.log
+StandardError=append:{{PROJECT_DIR}}/state/bridge.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,27 @@
+# systemd user-unit template for the runner daemon. install.sh substitutes:
+#   {{HOME}}        — $HOME of the runtime user
+#   {{PROJECT_DIR}} — full path to the Code-in-Tele repo on this Linux host
+#   {{LABEL}}       — short identifier (e.g. ct-runner)
+#   {{UV_PATH}}     — absolute path to the uv binary
+#
+# Install path: ~/.config/systemd/user/{{LABEL}}.service
+# Enable + start: systemctl --user enable --now {{LABEL}}.service
+# To survive SSH logout, run once: loginctl enable-linger $USER
+[Unit]
+Description=Code-in-Tele runner daemon ({{LABEL}})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={{UV_PATH}} run --project {{PROJECT_DIR}} python -m ct.runner.main
+WorkingDirectory={{PROJECT_DIR}}
+Restart=always
+RestartSec=10
+Environment=PATH={{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME={{HOME}}
+StandardOutput=append:{{PROJECT_DIR}}/state/runner.log
+StandardError=append:{{PROJECT_DIR}}/state/runner.log
+
+[Install]
+WantedBy=default.target
