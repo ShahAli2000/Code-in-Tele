@@ -1404,8 +1404,6 @@ class BridgeBot:
         # Drill into the new folder so the user sees they're inside it
         state["path"] = full_path
         state["name"] = folder_name
-        # Re-render the browse card. Build a fake CallbackQuery-like wrapper
-        # so we can reuse _refresh_browse, OR just edit directly here.
         try:
             resolved_path, items = await conn.list_dir(
                 full_path, show_hidden=state.get("show_hidden", False)
@@ -1414,24 +1412,25 @@ class BridgeBot:
             await message.answer(f"⚠ created {folder_name} but couldn't list it: {exc!s}")
             return
         state["items"] = items
-        try:
-            await self.bot.edit_message_text(
-                chat_id=self.settings.telegram_chat_id,
-                message_id=browse_msg_id,
-                text=menu_ui.navigate_text(
-                    mac_name=state["mac"], path=resolved_path,
-                    name=state["name"], folder_items=items,
-                    show_hidden=state.get("show_hidden", False),
-                ),
-                reply_markup=menu_ui.navigate_keyboard(
-                    folder_items=items,
-                    show_hidden=state.get("show_hidden", False),
-                    can_go_up=str(Path(resolved_path).parent) != resolved_path,
-                ),
-            )
-        except TelegramBadRequest:
-            pass
-        await message.answer(f"✓ created {full_path} — drilling in")
+        # The original browse card is far up in chat; send a NEW navigate card
+        # right here so the user can immediately confirm + open. Drop the old
+        # browse_state entry to avoid stale taps on the original card.
+        self._browse_state.pop(browse_msg_id, None)
+        sent = await self.bot.send_message(
+            chat_id=self.settings.telegram_chat_id,
+            text=f"✓ created {full_path}\n\n" + menu_ui.navigate_text(
+                mac_name=state["mac"], path=resolved_path,
+                name=state["name"], folder_items=items,
+                show_hidden=state.get("show_hidden", False),
+            ),
+            reply_markup=menu_ui.navigate_keyboard(
+                folder_items=items,
+                show_hidden=state.get("show_hidden", False),
+                can_go_up=str(Path(resolved_path).parent) != resolved_path,
+            ),
+        )
+        # Anchor the new card so subsequent button taps find this state.
+        self._browse_state[sent.message_id] = state
 
     async def _handle_set_name_reply(
         self, message: Message, pending: dict[str, Any]
@@ -1447,24 +1446,23 @@ class BridgeBot:
         else:
             new_name = raw[:64]  # bounded for forum-topic name
         state["name"] = new_name
-        try:
-            await self.bot.edit_message_text(
-                chat_id=self.settings.telegram_chat_id,
-                message_id=browse_msg_id,
-                text=menu_ui.navigate_text(
-                    mac_name=state["mac"], path=state["path"],
-                    name=new_name, folder_items=state["items"],
-                    show_hidden=state.get("show_hidden", False),
-                ),
-                reply_markup=menu_ui.navigate_keyboard(
-                    folder_items=state["items"],
-                    show_hidden=state.get("show_hidden", False),
-                    can_go_up=str(Path(state["path"]).parent) != state["path"],
-                ),
-            )
-        except TelegramBadRequest:
-            pass
-        await message.answer(f"✓ name → {new_name}")
+        # Send a fresh card here (rather than editing the original way up the
+        # chat) so the user sees the rename land + can immediately confirm.
+        self._browse_state.pop(browse_msg_id, None)
+        sent = await self.bot.send_message(
+            chat_id=self.settings.telegram_chat_id,
+            text=f"✓ name → {new_name}\n\n" + menu_ui.navigate_text(
+                mac_name=state["mac"], path=state["path"],
+                name=new_name, folder_items=state["items"],
+                show_hidden=state.get("show_hidden", False),
+            ),
+            reply_markup=menu_ui.navigate_keyboard(
+                folder_items=state["items"],
+                show_hidden=state.get("show_hidden", False),
+                can_go_up=str(Path(state["path"]).parent) != state["path"],
+            ),
+        )
+        self._browse_state[sent.message_id] = state
 
     async def _close_session_via_menu(self, session: TopicSession) -> None:
         """Called by the action card's close button."""
