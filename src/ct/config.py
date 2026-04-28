@@ -102,10 +102,11 @@ def load_settings(*, dotenv_path: Path | None = None, force: bool = False) -> Se
         runner_port=int(os.environ.get("CT_RUNNER_PORT", "8765")),
         log_level=os.environ.get("CT_LOG_LEVEL", "INFO").upper(),
         log_format=os.environ.get("CT_LOG_FORMAT", "console"),
-        # Default binds all interfaces so Tailscale-connected devices can reach
-        # the dashboard. The token is the auth; tighten via CT_DASHBOARD_HOST=
-        # 127.0.0.1 if you want strictly-local + only-via-/tunnel exposure.
-        dashboard_host=os.environ.get("CT_DASHBOARD_HOST", "0.0.0.0"),
+        # When CT_DASHBOARD_HOST is unset, the bridge probes `tailscale ip -4`
+        # at boot and binds to the tailnet IP — reachable from your phone or
+        # laptop on the tailnet, but not exposed on the LAN. Set explicitly
+        # to 127.0.0.1 for loopback-only, or 0.0.0.0 to bind all interfaces.
+        dashboard_host=os.environ.get("CT_DASHBOARD_HOST", "").strip(),
         dashboard_port=int(os.environ.get("CT_DASHBOARD_PORT", "8766")),
     )
     return _settings

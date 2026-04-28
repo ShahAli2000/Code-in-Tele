@@ -82,6 +82,51 @@ def _configure_logging(level: str, fmt: str) -> None:
     )
 
 
+def _resolve_dashboard_host(configured: str, log) -> str:
+    """Pick the dashboard bind address.
+
+    If CT_DASHBOARD_HOST is set explicitly, honor it (lets users override —
+    e.g. =0.0.0.0 to bind everywhere, or =127.0.0.1 for loopback). Otherwise
+    probe `tailscale ip -4` and bind to the first IPv4 the tailnet daemon
+    hands back, so the dashboard is reachable from your phone/laptop over
+    Tailscale but not exposed to the LAN. Falls back to 127.0.0.1 with a
+    warning if tailscale isn't installed or returns nothing.
+    """
+    if configured:
+        return configured
+
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+        if result.returncode == 0:
+            for raw in result.stdout.splitlines():
+                line = raw.strip()
+                if line:
+                    log.info("dashboard.bind_tailnet", host=line)
+                    return line
+        log.warning(
+            "dashboard.tailscale_returned_nothing",
+            returncode=result.returncode,
+        )
+    except FileNotFoundError:
+        log.warning("dashboard.tailscale_not_on_path")
+    except subprocess.TimeoutExpired:
+        log.warning("dashboard.tailscale_probe_timeout")
+    except Exception:
+        log.exception("dashboard.tailscale_probe_failed")
+
+    log.warning(
+        "dashboard.fallback_loopback",
+        reason="binding to 127.0.0.1 — dashboard will only be reachable locally",
+    )
+    return "127.0.0.1"
+
+
 async def _run() -> int:
     settings = load_settings()
     _configure_logging(settings.log_level, settings.log_format)
@@ -172,15 +217,20 @@ async def _run() -> int:
     # persisted, so URLs the user has bookmarked keep working across restarts.
     dashboard_token = await ensure_token(db)
     bridge._defaults_cache["dashboard_token"] = dashboard_token
+    dashboard_host = _resolve_dashboard_host(settings.dashboard_host, log)
+    # cloudflared (in /tunnel on) needs to know which address to proxy to —
+    # whatever we just bound the dashboard to. Stash it where cmd_tunnel can
+    # read it (alongside the dashboard token).
+    bridge._defaults_cache["dashboard_host"] = dashboard_host
     dashboard_runner = await serve_dashboard(
         bridge=bridge,
-        host=settings.dashboard_host,
+        host=dashboard_host,
         port=settings.dashboard_port,
         token=dashboard_token,
     )
     log.info(
         "dashboard.url",
-        local=f"http://{settings.dashboard_host}:{settings.dashboard_port}/?token={dashboard_token}",
+        local=f"http://{dashboard_host}:{settings.dashboard_port}/?token={dashboard_token}",
     )
 
     stop_event = asyncio.Event()

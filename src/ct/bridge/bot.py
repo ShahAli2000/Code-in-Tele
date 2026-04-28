@@ -1313,6 +1313,7 @@ class BridgeBot:
             try:
                 public = await self._tunnel.start(
                     local_port=self.settings.dashboard_port,
+                    local_host=self._defaults_cache.get("dashboard_host") or "127.0.0.1",
                 )
             except Exception as exc:
                 log.exception("tunnel.start_failed")

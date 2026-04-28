@@ -1,8 +1,9 @@
 """Cloudflared "Quick Tunnel" subprocess wrapper.
 
-`/tunnel on` spawns `cloudflared tunnel --url http://127.0.0.1:<port>` and
-parses its stderr for the public `https://*.trycloudflare.com` URL. `/tunnel
-off` SIGTERMs the subprocess.
+`/tunnel on` spawns `cloudflared tunnel --url http://<host>:<port>` (host
+defaults to the dashboard's bind address) and parses its stderr for the
+public `https://*.trycloudflare.com` URL. `/tunnel off` SIGTERMs the
+subprocess.
 
 Quick Tunnels are anonymous, ephemeral, and rate-limited - suitable for
 single-user "open my dashboard from my phone" use, not for production
@@ -42,10 +43,15 @@ class TunnelManager:
     def public_url(self) -> str | None:
         return self._public_url
 
-    async def start(self, *, local_port: int, timeout: float = 30.0) -> str:
-        """Spawn cloudflared and wait for the URL to appear in its output.
-        Raises if the binary is missing, the subprocess exits early, or the
-        URL doesn't appear within `timeout`."""
+    async def start(
+        self, *, local_port: int, local_host: str = "127.0.0.1",
+        timeout: float = 30.0,
+    ) -> str:
+        """Spawn cloudflared pointed at http://{local_host}:{local_port} and
+        wait for the public URL to appear in its output. The host must match
+        whatever address the dashboard is actually bound to — by default the
+        bridge passes its tailnet IP. Raises if the binary is missing, the
+        subprocess exits early, or the URL doesn't appear within `timeout`."""
         if self.is_running:
             raise RuntimeError(f"tunnel already running: {self._public_url}")
         binary = shutil.which("cloudflared")
@@ -53,10 +59,10 @@ class TunnelManager:
             raise RuntimeError(
                 "cloudflared not installed. brew install cloudflared, then retry."
             )
-        # All args come from typed parameters (port is int) and are passed as
-        # a list - no shell interpretation, no injection surface.
+        # All args come from typed parameters and are passed as a list — no
+        # shell interpretation, no injection surface.
         self._proc = await asyncio.create_subprocess_exec(
-            binary, "tunnel", "--url", f"http://127.0.0.1:{local_port}",
+            binary, "tunnel", "--url", f"http://{local_host}:{local_port}",
             "--no-autoupdate",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -89,7 +95,7 @@ class TunnelManager:
             await self.stop()
             raise
         self._public_url = url
-        log.info("tunnel.started", url=url, local_port=local_port)
+        log.info("tunnel.started", url=url, local_host=local_host, local_port=local_port)
         return url
 
     async def stop(self) -> None:
