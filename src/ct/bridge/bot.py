@@ -645,46 +645,18 @@ class BridgeBot:
         )
 
     async def cmd_profiles(self, message: Message) -> None:
-        """Text-based list of profiles. /profiles add ... is /save."""
-        rows = await self.db.list_profiles()
-        if not rows:
-            await message.answer(
-                "no saved profiles.\n"
-                "save one with: /save <name> [dir=...] [mac=...] [model=...] [effort=...] [mode=...]"
-            )
-            return
-        lines = ["saved profiles:"]
-        for r in rows:
-            bits: list[str] = []
-            if r.dir: bits.append(f"dir={r.dir}")
-            if r.runner_name: bits.append(f"mac={r.runner_name}")
-            if r.model: bits.append(f"model={r.model}")
-            if r.effort: bits.append(f"effort={r.effort}")
-            if r.permission_mode: bits.append(f"mode={r.permission_mode}")
-            details = ", ".join(bits) or "(no fields set; uses defaults)"
-            lines.append(f"  • {r.name}  ({details})")
-        lines.append("\nstart one with: /new <name>")
-        await message.answer("\n".join(lines))
+        """Button-driven list of profiles. Tap to show details + delete."""
+        await menu_ui.render_profiles(self.bot, self.settings.telegram_chat_id, self.db)
 
     async def cmd_defaults(self, message: Message) -> None:
-        """Show/set bot-wide defaults. Profiles + /new args layer on top."""
+        """Show/set bot-wide defaults. /defaults alone → button card.
+        /defaults key=value [...] → set via text."""
         if message.text is None:
             return
         tokens = message.text.strip().split()
-        # /defaults with no args → show
+        # /defaults with no args → button-driven card
         if len(tokens) == 1:
-            d = await self.db.all_defaults()
-            lines = [
-                "bot defaults (used when /new and profile don't set a field):",
-                f"  mac:    {d.get('default_runner_name') or '(none → studio)'}",
-                f"  model:  {d.get('default_model') or '(SDK default)'}",
-                f"  effort: {d.get('default_effort') or '(SDK default)'}",
-                f"  mode:   {d.get('default_permission_mode') or 'acceptEdits'}",
-                "",
-                "set with: /defaults [mac=...] [model=...] [effort=...] [mode=...]",
-                "unset:    /defaults model=null  (etc.)",
-            ]
-            await message.answer("\n".join(lines))
+            await menu_ui.render_defaults(self.bot, self.settings.telegram_chat_id, self.db)
             return
         # /defaults key=value [...] — try to parse via the same helper
         try:
@@ -1012,6 +984,13 @@ class BridgeBot:
             bot=self.bot,
             on_close=self._close_session_via_menu,
         ):
+            return
+        if await menu_ui.handle_defaults_callback(
+            query, db=self.db, bot=self.bot,
+            runner_names_fn=self.runners.names,
+        ):
+            return
+        if await menu_ui.handle_profiles_callback(query, db=self.db, bot=self.bot):
             return
         if await self._handle_new_menu_callback(query):
             return

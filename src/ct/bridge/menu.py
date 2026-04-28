@@ -1,17 +1,26 @@
-"""Per-topic action card — `/menu` (or `/m`) brings up an inline-keyboard
-view of the current session's settings; each tappable button drills into
-a submenu and pops back. The same message is edited rather than re-sent so
-the topic doesn't fill up with stale cards.
+"""Inline-keyboard cards for /menu (per-topic action card), /defaults
+(bot-wide defaults editor), and /profiles (profile list + delete).
 
-Callback-data layout:
-    ct:m:<sid>:root              — main view (pseudo, not emitted)
-    ct:m:<sid>:pick:<field>      — show submenu for `field` (model|effort|mode)
-    ct:m:<sid>:set:<field>:<v>   — apply value, return to root
-    ct:m:<sid>:close             — close session
-    ct:m:<sid>:back              — return to root view
+Callback-data layouts (each card has its own prefix):
+    Per-topic action card (`ct:m:`):
+        ct:m:<sid>:pick:<field>            show submenu (model|effort|mode)
+        ct:m:<sid>:set:<field>:<value>     apply value, return to root
+        ct:m:<sid>:back                    return to root view
+        ct:m:<sid>:close                   close session
 
-Where <sid> is `str(thread_id)`. Total stays well under Telegram's 64-byte
-callback_data cap because all the values we use are short literals.
+    Bot defaults (`ct:d:`):
+        ct:d:pick:<field>                  show submenu (mac|model|effort|mode)
+        ct:d:set:<field>:<value>           apply, return to root
+        ct:d:set:<field>:_unset            clear
+        ct:d:back                          return to root view
+
+    Profiles list (`ct:p:`):
+        ct:p:back                          back to list
+        ct:p:rm:<name>                     show delete confirmation
+        ct:p:rm_yes:<name>                 actually delete
+        ct:p:show:<name>                   show profile details
+
+Telegram caps callback_data at 64 bytes. Profile names are bounded by us.
 """
 
 from __future__ import annotations
@@ -266,3 +275,243 @@ async def _safe_edit(
         # "message is not modified" is fine — happens on no-op edits
         if "not modified" not in str(exc):
             log.warning("menu.edit_failed", error=str(exc))
+
+
+# ====== bot defaults editor (ct:d:*) ===================================
+
+DEFAULTS_PREFIX = "ct:d:"
+_UNSET = "_unset"  # sentinel value in callback_data
+
+
+async def _format_defaults(db) -> str:
+    d = await db.all_defaults()
+    return (
+        "⚙ bot defaults\n"
+        "(used when /new and the chosen profile don't pin the field)\n"
+        "\n"
+        f"mac:    {d.get('default_runner_name') or '(none)'}\n"
+        f"model:  {d.get('default_model') or '(SDK default)'}\n"
+        f"effort: {d.get('default_effort') or '(SDK default)'}\n"
+        f"mode:   {d.get('default_permission_mode') or 'acceptEdits'}"
+    )
+
+
+def _defaults_root_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👤 mac",   callback_data=DEFAULTS_PREFIX + "pick:mac"),
+                InlineKeyboardButton(text="🤖 model", callback_data=DEFAULTS_PREFIX + "pick:model"),
+            ],
+            [
+                InlineKeyboardButton(text="💪 effort", callback_data=DEFAULTS_PREFIX + "pick:effort"),
+                InlineKeyboardButton(text="⚙ mode",    callback_data=DEFAULTS_PREFIX + "pick:mode"),
+            ],
+        ]
+    )
+
+
+def _defaults_pick_keyboard(field: str, runner_names: list[str]) -> InlineKeyboardMarkup:
+    if field == "mac":
+        rows = [[
+            InlineKeyboardButton(text=n, callback_data=DEFAULTS_PREFIX + f"set:mac:{n}")
+            for n in runner_names[:3]
+        ]]
+        if len(runner_names) > 3:
+            rows.append([
+                InlineKeyboardButton(text=n, callback_data=DEFAULTS_PREFIX + f"set:mac:{n}")
+                for n in runner_names[3:6]
+            ])
+    elif field == "model":
+        rows = [[
+            InlineKeyboardButton(text=n, callback_data=DEFAULTS_PREFIX + f"set:model:{n}")
+            for n in MODEL_OPTIONS
+        ]]
+    elif field == "effort":
+        rows = [[
+            InlineKeyboardButton(text=n, callback_data=DEFAULTS_PREFIX + f"set:effort:{n}")
+            for n in EFFORT_OPTIONS
+        ]]
+    elif field == "mode":
+        rows = [
+            [InlineKeyboardButton(text=n, callback_data=DEFAULTS_PREFIX + f"set:mode:{n}")
+             for n in MODE_OPTIONS[:3]],
+            [InlineKeyboardButton(text=n, callback_data=DEFAULTS_PREFIX + f"set:mode:{n}")
+             for n in MODE_OPTIONS[3:]],
+        ]
+    else:
+        rows = []
+    rows.append([
+        InlineKeyboardButton(text="❌ unset", callback_data=DEFAULTS_PREFIX + f"set:{field}:{_UNSET}"),
+        InlineKeyboardButton(text="← back", callback_data=DEFAULTS_PREFIX + "back"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+_FIELD_TO_DB_KEY = {
+    "mac": "default_runner_name",
+    "model": "default_model",
+    "effort": "default_effort",
+    "mode": "default_permission_mode",
+}
+
+
+async def render_defaults(bot: Bot, chat_id: int, db) -> None:
+    await bot.send_message(
+        chat_id=chat_id,
+        text=await _format_defaults(db),
+        reply_markup=_defaults_root_keyboard(),
+    )
+
+
+async def handle_defaults_callback(
+    query: CallbackQuery, *, db, bot: Bot, runner_names_fn,
+) -> bool:
+    data = query.data or ""
+    if not data.startswith(DEFAULTS_PREFIX):
+        return False
+    rest = data[len(DEFAULTS_PREFIX):]
+    parts = rest.split(":")
+    if not parts:
+        await query.answer("malformed")
+        return True
+    verb = parts[0]
+    if verb == "back":
+        await _safe_edit(bot, query, text=await _format_defaults(db),
+                         keyboard=_defaults_root_keyboard())
+        await query.answer()
+        return True
+    if verb == "pick" and len(parts) >= 2:
+        field = parts[1]
+        await _safe_edit(
+            bot, query,
+            text=await _format_defaults(db) + f"\n\nchoose default {field}:",
+            keyboard=_defaults_pick_keyboard(field, runner_names_fn()),
+        )
+        await query.answer()
+        return True
+    if verb == "set" and len(parts) >= 3:
+        field, value = parts[1], parts[2]
+        db_key = _FIELD_TO_DB_KEY.get(field)
+        if not db_key:
+            await query.answer("unknown field")
+            return True
+        actual = None if value == _UNSET else MODEL_ALIASES.get(value, value) if field == "model" else value
+        await db.set_default(db_key, actual)
+        await _safe_edit(bot, query, text=await _format_defaults(db),
+                         keyboard=_defaults_root_keyboard())
+        await query.answer(f"{field} → {actual or '(unset)'}")
+        return True
+    await query.answer("unknown")
+    return True
+
+
+# ====== profiles list (ct:p:*) =========================================
+
+PROFILES_PREFIX = "ct:p:"
+
+
+async def _format_profile_one(profile) -> str:
+    bits: list[str] = []
+    if profile.dir: bits.append(f"dir={profile.dir}")
+    if profile.runner_name: bits.append(f"mac={profile.runner_name}")
+    if profile.model: bits.append(f"model={profile.model}")
+    if profile.effort: bits.append(f"effort={profile.effort}")
+    if profile.permission_mode: bits.append(f"mode={profile.permission_mode}")
+    body = "\n".join(f"  {b}" for b in bits) or "  (no fields set; uses defaults)"
+    return f"📁 {profile.name}\n{body}"
+
+
+def _profiles_list_keyboard(profiles) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for p in profiles:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"📁 {p.name}",
+                callback_data=PROFILES_PREFIX + f"show:{p.name}",
+            ),
+            InlineKeyboardButton(
+                text="🗑",
+                callback_data=PROFILES_PREFIX + f"rm:{p.name}",
+            ),
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _format_profiles_list(db) -> str:
+    profiles = await db.list_profiles()
+    if not profiles:
+        return "no saved profiles.\nuse /save <name> [dir=...] to add one."
+    return f"📚 saved profiles ({len(profiles)})"
+
+
+async def render_profiles(bot: Bot, chat_id: int, db) -> None:
+    profiles = await db.list_profiles()
+    text = await _format_profiles_list(db)
+    if not profiles:
+        await bot.send_message(chat_id=chat_id, text=text)
+        return
+    await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=_profiles_list_keyboard(profiles),
+    )
+
+
+async def handle_profiles_callback(query: CallbackQuery, *, db, bot: Bot) -> bool:
+    data = query.data or ""
+    if not data.startswith(PROFILES_PREFIX):
+        return False
+    rest = data[len(PROFILES_PREFIX):]
+    parts = rest.split(":", 1)
+    verb = parts[0]
+    if verb == "back":
+        profiles = await db.list_profiles()
+        await _safe_edit(
+            bot, query, text=await _format_profiles_list(db),
+            keyboard=_profiles_list_keyboard(profiles) if profiles else None,
+        )
+        await query.answer()
+        return True
+    if verb == "show" and len(parts) >= 2:
+        name = parts[1]
+        profile = await db.get_profile(name)
+        if profile is None:
+            await query.answer("profile no longer exists")
+            return True
+        await _safe_edit(
+            bot, query,
+            text=await _format_profile_one(profile)
+                + "\n\nuse /save with same name to edit, or /new to start.",
+            keyboard=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🗑 delete", callback_data=PROFILES_PREFIX + f"rm:{name}"),
+                InlineKeyboardButton(text="← back", callback_data=PROFILES_PREFIX + "back"),
+            ]]),
+        )
+        await query.answer()
+        return True
+    if verb == "rm" and len(parts) >= 2:
+        name = parts[1]
+        await _safe_edit(
+            bot, query,
+            text=f"🗑 delete profile {name!r}?\n\nthis only removes the saved\nconfig — any active sessions stay.",
+            keyboard=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✓ yes, delete", callback_data=PROFILES_PREFIX + f"rm_yes:{name}"),
+                InlineKeyboardButton(text="✗ cancel", callback_data=PROFILES_PREFIX + "back"),
+            ]]),
+        )
+        await query.answer()
+        return True
+    if verb == "rm_yes" and len(parts) >= 2:
+        name = parts[1]
+        ok = await db.delete_profile(name)
+        profiles = await db.list_profiles()
+        await _safe_edit(
+            bot, query,
+            text=f"{'✓ deleted' if ok else '⚠ not found'}: {name}\n\n" + await _format_profiles_list(db),
+            keyboard=_profiles_list_keyboard(profiles) if profiles else None,
+        )
+        await query.answer("deleted" if ok else "not found")
+        return True
+    await query.answer("unknown")
+    return True
