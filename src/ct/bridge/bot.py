@@ -243,6 +243,7 @@ class BridgeBot:
         self._router.message.register(self.cmd_export, Command("export"))
         self._router.message.register(self.cmd_get, Command("get"))
         self._router.message.register(self.cmd_quiet, Command("quiet"))
+        self._router.message.register(self.cmd_search, Command("search"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
 
         # Single text-message handler. Dispatches:
@@ -293,6 +294,7 @@ class BridgeBot:
             "  /export              — full transcript as a markdown file\n"
             "  /get <path>          — download a file from this session's runner\n"
             "  /quiet [HH:MM HH:MM] — silence non-permission pings during a window\n"
+            "  /search <pattern>    — substring search across all past transcripts\n"
             "  /macs [add|remove]   — manage registered runners\n"
             "  /status              — uptime, runners, sessions\n\n"
             "Just type in a topic to talk to Claude.\n"
@@ -1142,6 +1144,68 @@ class BridgeBot:
                 )
 
         await message.answer("\n".join(lines))
+
+    async def cmd_search(self, message: Message) -> None:
+        """Fan-out substring search across all runners' transcripts. Anywhere
+        the pattern appeared in a user/assistant message, surface a snippet
+        and (when known) the bridge topic name. Usage: /search <pattern>"""
+        text = (message.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.answer("usage: /search <pattern>\nmatches anywhere in past transcripts.")
+            return
+        pattern = parts[1].strip()
+        await message.answer(f"🔎 searching for {pattern!r} across {len(self.runners.names())} runner(s)…")
+
+        # Fan out — every runner searches its own ~/.claude/projects in parallel.
+        async def _one(name: str) -> tuple[str, list[dict]]:
+            try:
+                return name, await self.runners.get(name).search(pattern=pattern)
+            except Exception as exc:
+                log.warning("search.runner_failed", name=name, error=str(exc))
+                return name, []
+
+        runner_names = self.runners.names()
+        results = await asyncio.gather(*[_one(n) for n in runner_names])
+
+        # Cross-reference matches against known sessions so we can show the
+        # project name + topic link where possible.
+        known_by_sdk_id: dict[str, TopicSession] = {}
+        for s in self.sessions.all():
+            sid = s.runner.session_id
+            if sid:
+                known_by_sdk_id[sid] = s
+
+        total = sum(len(matches) for _, matches in results)
+        if total == 0:
+            await message.answer(f"no matches for {pattern!r}.")
+            return
+
+        lines = [f"🔎 {total} match(es) for {pattern!r}:"]
+        for runner_name, matches in results:
+            if not matches:
+                continue
+            for m in matches:
+                sdk_id = m.get("sdk_session_id", "")
+                role = m.get("role", "?")
+                snippet = m.get("snippet", "")
+                topic = known_by_sdk_id.get(sdk_id)
+                tag = "👤" if role == "user" else "🤖"
+                if topic is not None:
+                    header = f"\n📁 {topic.project_name} ({runner_name}) {tag} {role}"
+                else:
+                    header = f"\n📁 (closed/unknown) ({runner_name}) {tag} {role}"
+                lines.append(header)
+                lines.append(snippet)
+        body = "\n".join(lines)
+        if len(body) <= 3500:
+            await message.answer(body)
+        else:
+            from aiogram.types import BufferedInputFile
+            await message.answer_document(
+                BufferedInputFile(body.encode("utf-8"), filename=f"search-{pattern[:20]}.txt"),
+                caption=f"🔎 {total} matches for {pattern!r}",
+            )
 
     async def cmd_get(self, message: Message) -> None:
         """Pull a file off the runner and ship it to Telegram as an attachment.

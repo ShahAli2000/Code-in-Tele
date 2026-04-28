@@ -45,10 +45,11 @@ ALL_TYPES: frozenset[str] = frozenset({
     T_OPEN, T_SEND, T_DECIDE, T_SET_MODE, T_INTERRUPT, T_CLOSE, T_PING,
     "set_model",
     "list_dir", "mkdir", "upload", "fork", "get_logs", "export", "get_file",
+    "search",
     T_OPENED, T_SDK_ID, T_TEXT, T_TOOL_USE, T_TOOL_RESULT, T_THINKING,
     T_SYSTEM, T_PERMISSION_REQUEST, T_TURN_END, T_CLOSED, T_ERROR, T_PONG,
     "dir_listing", "mkdir_ok", "upload_ok", "fork_ok", "logs", "export_ok",
-    "file",
+    "file", "search_results",
 })
 
 
@@ -175,6 +176,12 @@ T_EXPORT_OK = "export_ok"          # runner → bridge: payload {markdown}
 T_GET_FILE = "get_file"            # bridge → runner: payload {path}
 T_FILE = "file"                    # runner → bridge: payload {path, content_b64, size}
 
+# /search — case-insensitive substring search across the runner's transcripts.
+# Bridge fans this out to every connected runner and aggregates.
+T_SEARCH = "search"                # bridge → runner: payload {pattern, max_results}
+T_SEARCH_RESULTS = "search_results"
+# runner → bridge: payload {matches: [{sdk_session_id, role, snippet, project_name}]}
+
 
 def list_dir_payload(path: str, show_hidden: bool = False) -> dict[str, Any]:
     return {"path": path, "show_hidden": show_hidden}
@@ -235,6 +242,14 @@ def get_file_payload(path: str) -> dict[str, Any]:
 
 def file_payload(*, path: str, content_b64: str, size: int) -> dict[str, Any]:
     return {"path": path, "content_b64": content_b64, "size": size}
+
+
+def search_payload(*, pattern: str, max_results: int = 30) -> dict[str, Any]:
+    return {"pattern": pattern, "max_results": max_results}
+
+
+def search_results_payload(matches: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"matches": matches}
 
 
 def send_payload(text: str) -> dict[str, Any]:

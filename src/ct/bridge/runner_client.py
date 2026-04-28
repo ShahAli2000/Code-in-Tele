@@ -33,6 +33,7 @@ import base64
 import contextlib
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any
 from dataclasses import dataclass
 
 import structlog
@@ -60,6 +61,8 @@ from ct.protocol.envelopes import (
     T_LOGS,
     T_MKDIR,
     T_MKDIR_OK,
+    T_SEARCH,
+    T_SEARCH_RESULTS,
     T_UPLOAD,
     T_UPLOAD_OK,
     T_OPEN,
@@ -81,6 +84,7 @@ from ct.protocol.envelopes import (
     get_logs_payload,
     list_dir_payload,
     mkdir_payload,
+    search_payload,
     upload_payload,
     open_payload,
     send_payload,
@@ -602,6 +606,24 @@ class RunnerConnection:
             if isinstance(role, str) and isinstance(text, str):
                 out.append((role, text))
         return out
+
+    async def search(
+        self, *, pattern: str, max_results: int = 30
+    ) -> list[dict[str, Any]]:
+        """Ask the runner to substring-match `pattern` across every transcript
+        on disk. Returns raw match dicts ({sdk_session_id, role, snippet,
+        project_dir}); the bridge decides how to render them."""
+        env = await self._call_rpc(
+            T_SEARCH,
+            search_payload(pattern=pattern, max_results=max_results),
+            timeout=15.0,
+        )
+        if env.type == T_ERROR:
+            raise RuntimeError(
+                f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
+            )
+        matches = env.payload.get("matches") or []
+        return [m for m in matches if isinstance(m, dict)]
 
     async def get_file(self, path: str) -> tuple[str, bytes]:
         """Read `path` on the runner. Returns (resolved_path, bytes). Raises

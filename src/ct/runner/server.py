@@ -80,6 +80,8 @@ from ct.protocol.envelopes import (
     T_LOGS,
     T_MKDIR,
     T_MKDIR_OK,
+    T_SEARCH,
+    T_SEARCH_RESULTS,
     T_UPLOAD,
     T_UPLOAD_OK,
     T_OPEN,
@@ -103,6 +105,7 @@ from ct.protocol.envelopes import (
     file_payload,
     fork_ok_payload,
     logs_payload,
+    search_results_payload,
     mkdir_ok_payload,
     upload_ok_payload,
     permission_request_payload,
@@ -234,6 +237,83 @@ def _render_session_message_markdown(m: Any) -> str | None:
     if not body:
         return None
     return f"{role_label}\n\n{body}"
+
+
+_SEARCH_SNIPPET_LEN = 240
+_SEARCH_PROJECTS_ROOT = pathlib.Path("~/.claude/projects").expanduser()
+
+
+def _extract_text_for_search(content: Any) -> str:
+    """Best-effort flatten of a JSONL message's content into one string.
+    Used by /search — the goal is "did the user ever say X" not perfect
+    rendering, so we deliberately drop tool input/output noise."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        bits: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                bits.append(block.get("text", ""))
+        return "\n".join(bits)
+    return ""
+
+
+def _search_transcripts(pattern: str, max_results: int) -> list[dict[str, Any]]:
+    """Synchronous (run in a thread) — walk JSONL files, find substring hits.
+
+    Returns at most `max_results` matches across all sessions. Each match:
+        {sdk_session_id, role, snippet, project_dir}
+    project_dir is the encoded directory name from ~/.claude/projects/<dir>/,
+    used by the bridge to map back to a known session."""
+    needle = pattern.lower()
+    out: list[dict[str, Any]] = []
+    if not _SEARCH_PROJECTS_ROOT.is_dir():
+        return out
+    for project_dir in sorted(_SEARCH_PROJECTS_ROOT.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        for jsonl_path in sorted(project_dir.glob("*.jsonl")):
+            sdk_session_id = jsonl_path.stem
+            try:
+                with jsonl_path.open("r", encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        if needle not in line.lower():
+                            continue
+                        # parse only when the cheap substring matched
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if obj.get("type") not in ("user", "assistant"):
+                            continue
+                        msg = obj.get("message")
+                        if not isinstance(msg, dict):
+                            continue
+                        text = _extract_text_for_search(msg.get("content"))
+                        if needle not in text.lower():
+                            continue
+                        # Center the snippet on the match
+                        idx = text.lower().find(needle)
+                        start = max(0, idx - 80)
+                        end = min(len(text), idx + len(pattern) + 80)
+                        snippet = text[start:end].strip()
+                        if start > 0:
+                            snippet = "…" + snippet
+                        if end < len(text):
+                            snippet += "…"
+                        out.append({
+                            "sdk_session_id": sdk_session_id,
+                            "role": obj.get("type"),
+                            "snippet": snippet[:_SEARCH_SNIPPET_LEN],
+                            "project_dir": project_dir.name,
+                        })
+                        if len(out) >= max_results:
+                            return out
+            except OSError:
+                continue
+    return out
 
 
 def _summarise_session_message(m: Any) -> str | None:
@@ -401,6 +481,8 @@ class RunnerConnection:
                 await self._handle_export(env)
             elif env.type == T_GET_FILE:
                 await self._handle_get_file(env)
+            elif env.type == T_SEARCH:
+                await self._handle_search(env)
             else:
                 await self._send_error(env.id, "unsupported_type", env.type)
         except Exception as exc:
@@ -682,6 +764,28 @@ class RunnerConnection:
                 T_FILE, env.id,
                 file_payload(path=str(path), content_b64=b64, size=len(data)),
             )
+        )
+
+    async def _handle_search(self, env: Envelope) -> None:
+        """Walk ~/.claude/projects/*/*.jsonl for case-insensitive substring
+        matches in user/assistant messages. Returns up to `max_results`
+        snippets — keeps the search bounded so a vague pattern doesn't
+        suck the whole transcript history into one envelope."""
+        pattern = env.payload.get("pattern")
+        max_results = int(env.payload.get("max_results", 30))
+        if not isinstance(pattern, str) or not pattern.strip():
+            await self._send_error(env.id, "bad_request", "search.pattern required")
+            return
+        try:
+            matches = await asyncio.to_thread(
+                _search_transcripts, pattern, max_results
+            )
+        except Exception as exc:
+            log.exception("runner.search_failed", pattern=pattern)
+            await self._send_error(env.id, "search_failed", repr(exc))
+            return
+        await self._send(
+            Envelope(T_SEARCH_RESULTS, env.id, search_results_payload(matches))
         )
 
     async def _handle_fork(self, env: Envelope) -> None:
