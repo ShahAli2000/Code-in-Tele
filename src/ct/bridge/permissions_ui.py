@@ -34,7 +34,11 @@ log = structlog.get_logger(__name__)
 
 # Callback data is bounded to 64 bytes by Telegram. Format:
 #   "ct:p:<decision>:<tool_use_id>"
-# decision is one char (a=allow, d=deny). tool_use_id is ~30 chars.
+# decision is one char:
+#   a = allow
+#   d = deny
+#   r = allow + remember (always allow this tool name in this session)
+# tool_use_id is ~30 chars.
 CB_PREFIX = "ct:p:"
 
 
@@ -48,7 +52,7 @@ def parse_callback_data(data: str) -> tuple[str, str] | None:
         return None
     rest = data[len(CB_PREFIX) :]
     decision, _, tool_use_id = rest.partition(":")
-    if decision not in ("a", "d") or not tool_use_id:
+    if decision not in ("a", "d", "r") or not tool_use_id:
         return None
     return decision, tool_use_id
 
@@ -62,7 +66,17 @@ def _format_card(request: PermissionRequest) -> str:
     )
 
 
-def _make_keyboard(tool_use_id: str) -> InlineKeyboardMarkup:
+def _make_keyboard(tool_use_id: str, tool_name: str = "") -> InlineKeyboardMarkup:
+    # Two rows so the high-blast-radius "always allow" is visually distinct
+    # from the per-call Approve/Deny.
+    remember_label = (
+        f"✓ Always allow {tool_name} (this session)" if tool_name
+        else "✓ Always allow (this session)"
+    )
+    # Telegram caps button labels around 64 chars; tool names are short but
+    # be defensive.
+    if len(remember_label) > 60:
+        remember_label = remember_label[:57] + "…"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -74,7 +88,13 @@ def _make_keyboard(tool_use_id: str) -> InlineKeyboardMarkup:
                     text="✗ Deny",
                     callback_data=_make_callback_data(tool_use_id, "d"),
                 ),
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text=remember_label,
+                    callback_data=_make_callback_data(tool_use_id, "r"),
+                ),
+            ],
         ]
     )
 
@@ -99,7 +119,7 @@ class PermissionsUI:
         request: PermissionRequest,
     ) -> None:
         text = _format_card(request)
-        keyboard = _make_keyboard(request.tool_use_id)
+        keyboard = _make_keyboard(request.tool_use_id, request.tool_name)
         try:
             sent = await self._bot.send_message(
                 chat_id=chat_id,
@@ -175,21 +195,33 @@ class PermissionsUI:
             return True
 
         runner, chat_id, message_id, original_text = entry
-        allow = decision == "a"
+        allow = decision in ("a", "r")
+        remember = decision == "r"
         resolved = await runner.resolve_permission(
-            tool_use_id, allow=allow, deny_message="User denied via Telegram"
+            tool_use_id,
+            allow=allow,
+            deny_message="User denied via Telegram",
+            remember=remember,
         )
         if not resolved:
             await query.answer("already resolved", show_alert=False)
         else:
-            await query.answer("approved" if allow else "denied")
+            if decision == "r":
+                await query.answer("approved + remembered")
+            else:
+                await query.answer("approved" if allow else "denied")
         try:
             await self._db.delete_pending_permission(tool_use_id)
         except Exception:
             log.exception("permission_card.delete_failed", tool_use_id=tool_use_id)
 
         # Replace the card with a finalized version (no buttons).
-        marker = "✓ APPROVED" if allow else "✗ DENIED"
+        if decision == "r":
+            marker = "✓ APPROVED + remembered for this session"
+        elif allow:
+            marker = "✓ APPROVED"
+        else:
+            marker = "✗ DENIED"
         finalized = f"{original_text}\n\n— {marker}"
         try:
             await self._bot.edit_message_text(

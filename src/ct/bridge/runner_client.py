@@ -170,6 +170,7 @@ class SessionHandle:
         allow: bool,
         updated_input: dict | None = None,
         deny_message: str = "User denied this action",
+        remember: bool = False,
     ) -> bool:
         await self._conn._send(
             Envelope(
@@ -180,6 +181,7 @@ class SessionHandle:
                     allow=allow,
                     updated_input=updated_input,
                     deny_message=deny_message,
+                    remember=remember,
                 ),
             )
         )

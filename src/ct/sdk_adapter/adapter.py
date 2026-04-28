@@ -76,6 +76,30 @@ mention of git.
 """
 
 
+# Auto-test directive: nudge Claude to actually run the project's tests after
+# meaningful Edit/Write changes. Heuristic-only — Claude inspects the project
+# to figure out the right runner; if there's no test infrastructure, this
+# directive is a no-op.
+TEST_WORKFLOW_DIRECTIVE = """
+Test workflow for this session:
+- After non-trivial Edit/Write changes, look for a project test runner and \
+run the tests that cover the change. Common runners include `pytest`, \
+`npm test` / `pnpm test` / `yarn test`, `cargo test`, `go test ./...`, \
+`uv run pytest`, `bun test`. Detect them from the project's manifest \
+(`pyproject.toml`, `package.json`, `Cargo.toml`, `go.mod`, etc.) before \
+guessing.
+- Prefer running just the relevant test file or test name when you know \
+which area you touched. Only fall back to the full suite when the change \
+is broad or you're unsure.
+- If tests fail, treat the failure as part of the work — diagnose, fix, \
+re-run. Don't move on to a new change with the suite red.
+- If there's no obvious test runner or test directory, skip this entirely \
+— don't invent infrastructure for prototypes or one-off scripts.
+- Don't run tests for purely cosmetic changes (formatting, comments, \
+whitespace) where there's no behaviour to verify.
+"""
+
+
 
 @dataclass
 class PermissionRequest:
@@ -119,7 +143,14 @@ class SessionRunner:
         self.session_id: str | None = resume
 
         self._client: ClaudeSDKClient | None = None
-        self._pending: dict[str, asyncio.Future[tuple[str, Any]]] = {}
+        # Future value is (decision, payload, remember). The third slot lets the
+        # bridge signal "approve this tool, and skip the prompt for any further
+        # use of the same tool within this session".
+        self._pending: dict[str, asyncio.Future[tuple[str, Any, bool]]] = {}
+        # Tool names the user has chosen to always-allow for this session.
+        # Cleared on stop; deliberately NOT persisted across runner restarts —
+        # a fresh SDK process means a fresh trust ledger.
+        self._remembered_allows: set[str] = set()
         self._closed = False
 
     # ---- lifecycle ----------------------------------------------------------
@@ -139,7 +170,7 @@ class SessionRunner:
         # text). Using SystemPromptPreset rather than a plain string preserves
         # Claude Code's full default behaviour — tool descriptions, planning
         # heuristics, formatting guidance, etc.
-        append_parts: list[str] = [GIT_WORKFLOW_DIRECTIVE]
+        append_parts: list[str] = [GIT_WORKFLOW_DIRECTIVE, TEST_WORKFLOW_DIRECTIVE]
         if self.system_prompt:
             append_parts.append(self.system_prompt)
         sdk_system_prompt: Any = {
@@ -183,8 +214,9 @@ class SessionRunner:
 
         for fut in list(self._pending.values()):
             if not fut.done():
-                fut.set_result(("deny", "session stopped"))
+                fut.set_result(("deny", "session stopped", False))
         self._pending.clear()
+        self._remembered_allows.clear()
 
         if self._client is not None:
             with contextlib.suppress(Exception):
@@ -253,13 +285,22 @@ class SessionRunner:
         allow: bool,
         updated_input: dict[str, Any] | None = None,
         deny_message: str = "User denied this action",
+        remember: bool = False,
     ) -> bool:
         """Bridge calls this when the user taps Approve/Deny. Returns True if a
-        pending request matched (False if it had already resolved or is unknown)."""
+        pending request matched (False if it had already resolved or is unknown).
+
+        `remember=True` (only meaningful with allow=True) tells the runner to
+        skip future approval prompts for this tool name within the current
+        session. The actual rule is recorded inside `_can_use_tool` after the
+        future resolves so the tool_name binding is in scope."""
         fut = self._pending.get(tool_use_id)
         if fut is None or fut.done():
             return False
-        fut.set_result(("allow", updated_input) if allow else ("deny", deny_message))
+        if allow:
+            fut.set_result(("allow", updated_input, remember))
+        else:
+            fut.set_result(("deny", deny_message, False))
         return True
 
     # ---- internals ----------------------------------------------------------
@@ -272,6 +313,16 @@ class SessionRunner:
     ) -> PermissionResultAllow | PermissionResultDeny:
         tool_use_id = context.tool_use_id
 
+        # Approve-and-remember: if the user has previously chosen "always allow"
+        # for this tool name in this session, skip the round-trip to Telegram.
+        if tool_name in self._remembered_allows:
+            log.info(
+                "permission.remembered_auto_allow",
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+            )
+            return PermissionResultAllow(updated_input=input_data)
+
         # Fail-closed: no handler registered = deny.
         if self.on_permission_request is None:
             log.warning(
@@ -282,7 +333,7 @@ class SessionRunner:
         # Key by tool_use_id, NOT session_id. Multiple tool_use blocks per turn
         # otherwise silently overwrite each other and the first never resolves.
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future[tuple[str, Any]] = loop.create_future()
+        fut: asyncio.Future[tuple[str, Any, bool]] = loop.create_future()
         self._pending[tool_use_id] = fut
 
         request = PermissionRequest(
@@ -302,11 +353,18 @@ class SessionRunner:
             return PermissionResultDeny(message=f"approval handler error: {exc!r}")
 
         try:
-            decision, payload = await fut
+            decision, payload, remember = await fut
         finally:
             self._pending.pop(tool_use_id, None)
 
         if decision == "allow":
+            if remember:
+                self._remembered_allows.add(tool_name)
+                log.info(
+                    "permission.remember_added",
+                    tool_use_id=tool_use_id,
+                    tool_name=tool_name,
+                )
             return PermissionResultAllow(updated_input=payload or input_data)
         return PermissionResultDeny(message=str(payload or "denied"))
 

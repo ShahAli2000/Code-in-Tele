@@ -502,6 +502,7 @@ class RunnerConnection:
         p = env.payload
         tool_use_id = p.get("tool_use_id")
         allow = bool(p.get("allow", False))
+        remember = bool(p.get("remember", False))
         if not isinstance(tool_use_id, str) or not tool_use_id:
             await self._send_error(env.id, "bad_request", "decide.tool_use_id required")
             return
@@ -510,6 +511,7 @@ class RunnerConnection:
             allow=allow,
             updated_input=p.get("updated_input"),
             deny_message=p.get("deny_message", "User denied this action"),
+            remember=remember,
         )
 
     async def _handle_set_mode(self, env: Envelope) -> None:

@@ -229,12 +229,15 @@ def send_payload(text: str) -> dict[str, Any]:
 
 def decide_payload(*, tool_use_id: str, allow: bool,
                    updated_input: dict[str, Any] | None = None,
-                   deny_message: str | None = None) -> dict[str, Any]:
+                   deny_message: str | None = None,
+                   remember: bool = False) -> dict[str, Any]:
     p: dict[str, Any] = {"tool_use_id": tool_use_id, "allow": allow}
     if allow and updated_input is not None:
         p["updated_input"] = updated_input
     if not allow and deny_message is not None:
         p["deny_message"] = deny_message
+    if remember:
+        p["remember"] = True
     return p
 
 
