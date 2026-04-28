@@ -182,6 +182,10 @@ async def _run() -> int:
         ),
         name="bridge-polling",
     )
+    # Start the idle housekeeping loop. It expires stale permission cards
+    # every IDLE_CHECK_INTERVAL_S — separate task so a slow expiry edit
+    # doesn't block polling.
+    idle_task = bridge.start_idle_check()
 
     await stop_event.wait()
     log.info("bridge.shutting_down")
@@ -190,8 +194,13 @@ async def _run() -> int:
     # also exposes an awaitable stop_polling() coroutine, but cancellation is
     # safer because it works regardless of the dispatcher's internal state.
     polling_task.cancel()
+    idle_task.cancel()
     try:
         await polling_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    try:
+        await idle_task
     except (asyncio.CancelledError, Exception):
         pass
 

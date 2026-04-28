@@ -265,12 +265,22 @@ class Db:
         )
         await self.conn.commit()
 
-    async def list_undecided_permissions(self) -> list[PendingPermissionRow]:
-        async with self.conn.execute(
+    async def list_undecided_permissions(
+        self, *, older_than_minutes: int | None = None
+    ) -> list[PendingPermissionRow]:
+        sql = (
             "SELECT tool_use_id, thread_id, message_id, tool_name, input_json, "
             "created_at, decided_at, decision "
-            "FROM pending_permissions WHERE decided_at IS NULL ORDER BY created_at"
-        ) as cur:
+            "FROM pending_permissions WHERE decided_at IS NULL"
+        )
+        params: tuple = ()
+        if older_than_minutes is not None:
+            sql += " AND created_at <= datetime('now', ?)"
+            sql += " ORDER BY created_at"
+            params = (f"-{int(older_than_minutes)} minutes",)
+        else:
+            sql += " ORDER BY created_at"
+        async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
         return [PendingPermissionRow(*r) for r in rows]
 

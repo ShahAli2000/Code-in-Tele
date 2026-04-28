@@ -152,6 +152,52 @@ class PermissionsUI:
         except Exception:
             log.exception("permission_card.persist_failed", tool_use_id=request.tool_use_id)
 
+    async def expire_stale(self, chat_id: int, max_age_minutes: int = 30) -> int:
+        """Expire any in-flight permission card older than `max_age_minutes`.
+        Called by the bridge's periodic idle-check task. Distinct from
+        expire_orphans (which clears DB rows whose runners are gone) — this
+        one releases the runner-side future as deny so the SDK unblocks.
+        Returns count expired."""
+        rows = await self._db.list_undecided_permissions(
+            older_than_minutes=max_age_minutes
+        )
+        if not rows:
+            return 0
+        for row in rows:
+            entry = self._pending.pop(row.tool_use_id, None)
+            if entry is not None:
+                runner, _, _, _ = entry
+                # Release the SDK callback so it doesn't hang the next turn.
+                # If the runner is no longer tracking this tool_use_id (race
+                # with bridge reconnect), this is a harmless no-op.
+                try:
+                    await runner.resolve_permission(
+                        row.tool_use_id,
+                        allow=False,
+                        deny_message="approval card timed out",
+                    )
+                except Exception:
+                    log.exception(
+                        "permission_card.expire_resolve_failed",
+                        tool_use_id=row.tool_use_id,
+                    )
+            try:
+                await self._bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=row.message_id,
+                    text=(
+                        f"🤔 Approval needed\n"
+                        f"🔧 {row.tool_name}\n\n"
+                        f"— ✗ EXPIRED ({max_age_minutes} min idle; ask Claude again if you still want this)"
+                    ),
+                    reply_markup=None,
+                )
+            except TelegramBadRequest:
+                pass
+            await self._db.mark_permission_decided(row.tool_use_id, "expired")
+        log.info("permission_card.expired_stale", count=len(rows))
+        return len(rows)
+
     async def expire_orphans(self, chat_id: int) -> int:
         """Called once at bridge boot: any pending rows still in the DB are
         leftovers from before the restart. The runner-side futures backing

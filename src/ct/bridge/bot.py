@@ -2467,6 +2467,38 @@ class BridgeBot:
 
     # ---- lifecycle ----------------------------------------------------------
 
+    # ---- idle housekeeping --------------------------------------------------
+
+    # Tunables: tolerable lag between idle event and notice. Default checks
+    # every 5 minutes, expires permission cards older than 30 min.
+    IDLE_CHECK_INTERVAL_S = 300
+    PERMISSION_MAX_AGE_MIN = 30
+
+    async def _idle_check_loop(self) -> None:
+        """Background task — periodically expire stale permission cards.
+        Lives for the lifetime of the bridge process. Wakes once per
+        IDLE_CHECK_INTERVAL_S; each tick is bounded so a slow Telegram edit
+        can't pile up cycles."""
+        while True:
+            try:
+                await asyncio.sleep(self.IDLE_CHECK_INTERVAL_S)
+            except asyncio.CancelledError:
+                return
+            try:
+                count = await self.permissions_ui.expire_stale(
+                    chat_id=self.settings.telegram_chat_id,
+                    max_age_minutes=self.PERMISSION_MAX_AGE_MIN,
+                )
+                if count:
+                    log.info("idle.expired_permissions", count=count)
+            except Exception:
+                log.exception("idle.tick_failed")
+
+    def start_idle_check(self) -> asyncio.Task:
+        """Called by main.py after polling starts. Returned task is cancelled
+        on shutdown so the bridge exits cleanly."""
+        return asyncio.create_task(self._idle_check_loop(), name="bridge-idle-check")
+
     async def shutdown(self) -> None:
         for s in self.sessions.all():
             self.permissions_ui.cancel_pending_for(s.runner)
