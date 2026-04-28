@@ -53,6 +53,7 @@ from claude_agent_sdk import (
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
+    fork_session,
 )
 
 from ct.protocol.auth import frame, unframe
@@ -64,6 +65,8 @@ from ct.protocol.envelopes import (
     T_DECIDE,
     T_DIR_LISTING,
     T_ERROR,
+    T_FORK,
+    T_FORK_OK,
     T_INTERRUPT,
     T_LIST_DIR,
     T_MKDIR,
@@ -87,6 +90,7 @@ from ct.protocol.envelopes import (
     closed_payload,
     dir_listing_payload,
     error_payload,
+    fork_ok_payload,
     mkdir_ok_payload,
     upload_ok_payload,
     permission_request_payload,
@@ -267,6 +271,8 @@ class RunnerConnection:
                 await self._handle_mkdir(env)
             elif env.type == T_UPLOAD:
                 await self._handle_upload(env)
+            elif env.type == T_FORK:
+                await self._handle_fork(env)
             else:
                 await self._send_error(env.id, "unsupported_type", env.type)
         except Exception as exc:
@@ -507,6 +513,39 @@ class RunnerConnection:
             return
         await self._send(
             Envelope(T_UPLOAD_OK, env.id, upload_ok_payload(str(path), len(data)))
+        )
+
+    async def _handle_fork(self, env: Envelope) -> None:
+        """Fork the on-disk transcript file via the SDK's fork_session().
+        Synchronous file I/O — run on a thread so we don't block the event loop."""
+        sdk_session_id = env.payload.get("sdk_session_id")
+        cwd = env.payload.get("cwd")
+        title = env.payload.get("title")
+        if not isinstance(sdk_session_id, str) or not sdk_session_id:
+            await self._send_error(env.id, "bad_request", "fork.sdk_session_id required")
+            return
+        if not isinstance(cwd, str) or not cwd:
+            await self._send_error(env.id, "bad_request", "fork.cwd required")
+            return
+        try:
+            result = await asyncio.to_thread(
+                fork_session,
+                sdk_session_id,
+                directory=cwd,
+                title=title if isinstance(title, str) else None,
+            )
+        except FileNotFoundError as exc:
+            await self._send_error(env.id, "not_found", str(exc))
+            return
+        except ValueError as exc:
+            await self._send_error(env.id, "bad_request", str(exc))
+            return
+        except Exception as exc:
+            log.exception("runner.fork_failed", sdk_session_id=sdk_session_id, cwd=cwd)
+            await self._send_error(env.id, "fork_failed", repr(exc))
+            return
+        await self._send(
+            Envelope(T_FORK_OK, env.id, fork_ok_payload(result.session_id))
         )
 
     async def _handle_close(self, env: Envelope) -> None:

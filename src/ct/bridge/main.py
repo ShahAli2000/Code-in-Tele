@@ -37,6 +37,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="model",       description="Show or live-swap the model"),
     BotCommand(command="effort",      description="Show or set effort level"),
     BotCommand(command="close",       description="Close this topic's session"),
+    BotCommand(command="fork",        description="Branch this session into a new topic"),
     BotCommand(command="save",        description="Save a project profile"),
     BotCommand(command="profiles",    description="List saved profiles"),
     BotCommand(command="defaults",    description="Show or set bot-wide defaults"),

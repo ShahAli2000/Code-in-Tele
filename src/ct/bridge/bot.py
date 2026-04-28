@@ -227,6 +227,7 @@ class BridgeBot:
         self._router.message.register(self.cmd_defaults, Command("defaults"))
         self._router.message.register(self.cmd_profiles, Command("profiles"))
         self._router.message.register(self.cmd_menu, Command("menu", "m"))
+        self._router.message.register(self.cmd_fork, Command("fork"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
 
         # Single text-message handler. Dispatches:
@@ -271,6 +272,7 @@ class BridgeBot:
             "  /model [name]        — live-swap model (or use /m)\n"
             "  /effort [level]      — set effort (or use /m)\n"
             "  /close               — close this topic's session\n"
+            "  /fork [name]         — branch this session into a new topic\n"
             "  /macs [add|remove]   — manage registered runners\n"
             "  /status              — uptime, runners, sessions\n\n"
             "Just type in a topic to talk to Claude.\n"
@@ -895,11 +897,15 @@ class BridgeBot:
         await self._execute_new_session(resolved, source_label=f"profile: {profile_name}")
 
     async def _execute_new_session(
-        self, resolved: "ResolvedSession", *, source_label: str = ""
+        self, resolved: "ResolvedSession", *, source_label: str = "",
+        resume: str | None = None,
     ) -> int | None:
         """Common path: validate runner + cwd, create topic, open session, add
         to store, post ready card. Returns the new thread_id or None on failure
-        (errors are surfaced via Telegram messages)."""
+        (errors are surfaced via Telegram messages).
+
+        If `resume` is set, the SDK reattaches to that session id (used by /fork
+        to bring a forked transcript to life)."""
         cwd = Path(resolved.cwd).expanduser()
         runner_name = resolved.runner_name
 
@@ -951,6 +957,7 @@ class BridgeBot:
                 mode=resolved.permission_mode,  # type: ignore[arg-type]
                 model=resolved.model,
                 effort=resolved.effort,
+                resume=resume,
                 on_permission_request=perm_handler,
                 on_session_id_assigned=self._make_id_persister(thread_id),
             )
@@ -1037,6 +1044,66 @@ class BridgeBot:
                 )
 
         await message.answer("\n".join(lines))
+
+    async def cmd_fork(self, message: Message) -> None:
+        """Branch this topic's session into a new topic with the same transcript
+        and settings. Useful for trying a different approach without losing the
+        original conversation. Usage: /fork [new-name]"""
+        if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
+            await message.answer("/fork only works inside a session topic")
+            return
+        session = self.sessions.get(message.message_thread_id)
+        if session is None:
+            await message.answer("no session in this topic.")
+            return
+        sdk_id = session.runner.session_id
+        if not sdk_id:
+            await message.answer(
+                "⚠ this session has no sdk_session_id yet — send at least one "
+                "message before forking so the transcript exists on disk."
+            )
+            return
+
+        # Optional name arg; default = "<orig>-fork".
+        text = (message.text or message.caption or "").strip()
+        parts = text.split(maxsplit=1)
+        new_name = parts[1].strip() if len(parts) > 1 else f"{session.project_name}-fork"
+
+        await message.answer(f"⏳ forking {session.project_name!r} → {new_name!r} …")
+
+        try:
+            new_sdk_id = await self.runners.get(session.runner_name).fork_session(
+                sdk_session_id=sdk_id,
+                cwd=session.cwd,
+                title=new_name,
+            )
+        except Exception as exc:
+            log.exception(
+                "session.fork_failed",
+                thread_id=session.thread_id,
+                sdk_session_id=sdk_id,
+            )
+            await message.answer(f"⚠ fork failed: {exc!s}")
+            return
+
+        # Inherit everything from the source session — same mac, cwd, model,
+        # effort, mode. New name and new sdk_session_id (resume target).
+        # Re-fetch the live runner's current permission_mode in case it was
+        # changed since /new.
+        permission_mode = session.runner.permission_mode
+        resolved = ResolvedSession(
+            name=new_name,
+            cwd=session.cwd,
+            runner_name=session.runner_name,
+            model=session.model,
+            effort=session.effort,
+            permission_mode=permission_mode,
+        )
+        await self._execute_new_session(
+            resolved,
+            source_label=f"fork of {session.project_name}",
+            resume=new_sdk_id,
+        )
 
     async def cmd_close(self, message: Message) -> None:
         if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:

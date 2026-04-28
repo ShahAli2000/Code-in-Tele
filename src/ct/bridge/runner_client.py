@@ -48,6 +48,8 @@ from ct.protocol.envelopes import (
     T_DECIDE,
     T_DIR_LISTING,
     T_ERROR,
+    T_FORK,
+    T_FORK_OK,
     T_INTERRUPT,
     T_LIST_DIR,
     T_MKDIR,
@@ -67,6 +69,7 @@ from ct.protocol.envelopes import (
     T_TOOL_USE,
     T_TURN_END,
     decide_payload,
+    fork_payload,
     list_dir_payload,
     mkdir_payload,
     upload_payload,
@@ -563,6 +566,27 @@ class RunnerConnection:
                 f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
             )
         return env.payload.get("path", path), int(env.payload.get("size", len(content)))
+
+    async def fork_session(
+        self, *, sdk_session_id: str, cwd: str, title: str | None = None
+    ) -> str:
+        """Fork the on-disk transcript file for `sdk_session_id`. Returns the
+        new sdk_session_id. The runner runs fork_session() (synchronous file
+        I/O) on a thread, then replies with the new id. Caller is expected to
+        then open_session(resume=<new_id>) to bring the fork to life."""
+        env = await self._call_rpc(
+            T_FORK,
+            fork_payload(sdk_session_id=sdk_session_id, cwd=cwd, title=title),
+            timeout=30.0,
+        )
+        if env.type == T_ERROR:
+            raise RuntimeError(
+                f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
+            )
+        new_id = env.payload.get("sdk_session_id")
+        if not isinstance(new_id, str) or not new_id:
+            raise RuntimeError("fork reply missing sdk_session_id")
+        return new_id
 
     async def open_session(
         self,

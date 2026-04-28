@@ -44,10 +44,10 @@ T_PONG = "pong"               # heartbeat reply
 ALL_TYPES: frozenset[str] = frozenset({
     T_OPEN, T_SEND, T_DECIDE, T_SET_MODE, T_INTERRUPT, T_CLOSE, T_PING,
     "set_model",
-    "list_dir", "mkdir", "upload",
+    "list_dir", "mkdir", "upload", "fork",
     T_OPENED, T_SDK_ID, T_TEXT, T_TOOL_USE, T_TOOL_RESULT, T_THINKING,
     T_SYSTEM, T_PERMISSION_REQUEST, T_TURN_END, T_CLOSED, T_ERROR, T_PONG,
-    "dir_listing", "mkdir_ok", "upload_ok",
+    "dir_listing", "mkdir_ok", "upload_ok", "fork_ok",
 })
 
 
@@ -152,6 +152,13 @@ T_MKDIR_OK = "mkdir_ok"            # runner → bridge: payload {path}
 T_UPLOAD = "upload"                # bridge → runner: payload {path, content_b64}
 T_UPLOAD_OK = "upload_ok"          # runner → bridge: payload {path, size}
 
+# /fork — fork an existing SDK session. fork_session() reads/writes the on-disk
+# .jsonl file in ~/.claude/projects/, so the operation MUST run on the runner
+# that originally hosted the session (its file isn't on the bridge for remote
+# macs). Connection-level RPC keyed by Envelope.id as request_id.
+T_FORK = "fork"                    # bridge → runner: payload {sdk_session_id, cwd, title?}
+T_FORK_OK = "fork_ok"              # runner → bridge: payload {sdk_session_id}
+
 
 def list_dir_payload(path: str, show_hidden: bool = False) -> dict[str, Any]:
     return {"path": path, "show_hidden": show_hidden}
@@ -175,6 +182,18 @@ def upload_payload(path: str, content_b64: str) -> dict[str, Any]:
 
 def upload_ok_payload(path: str, size: int) -> dict[str, Any]:
     return {"path": path, "size": size}
+
+
+def fork_payload(*, sdk_session_id: str, cwd: str,
+                 title: str | None = None) -> dict[str, Any]:
+    p: dict[str, Any] = {"sdk_session_id": sdk_session_id, "cwd": cwd}
+    if title is not None:
+        p["title"] = title
+    return p
+
+
+def fork_ok_payload(sdk_session_id: str) -> dict[str, Any]:
+    return {"sdk_session_id": sdk_session_id}
 
 
 def send_payload(text: str) -> dict[str, Any]:
