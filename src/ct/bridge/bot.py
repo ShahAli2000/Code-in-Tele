@@ -2523,15 +2523,11 @@ class BridgeBot:
                     fallback=self.default_runner,
                 )
                 runner_name = self.default_runner
-            # Re-apply the bot-wide auto-allow list on restore — restored
-            # sessions get a fresh in-memory _remembered_allows ledger, so
-            # without this step `/allow` settings only kick in for /new
-            # sessions, surprising users who've configured their pre-trust
-            # list and just restarted the bridge.
-            allow_csv = (
-                self._defaults_cache.get("default_auto_allow_tools") or ""
-            ).strip()
-            allow_list = [t.strip() for t in allow_csv.split(",") if t.strip()]
+            # NOTE: `/allow` is intentionally NOT applied on session restore —
+            # restored sessions are already underway, and silently granting
+            # pre-trust after an unattended bridge crash would expand
+            # permissions the user didn't reauthorize. The user can /restart
+            # a session to opt in. /new and /restart pick it up.
             handle = await self.runners.get(runner_name).open_session(
                 sid=str(spec.thread_id),
                 cwd=spec.cwd,
@@ -2539,7 +2535,6 @@ class BridgeBot:
                 resume=spec.sdk_session_id,
                 model=spec.model,
                 effort=spec.effort,
-                auto_allow_tools=allow_list or None,
                 on_permission_request=perm_handler,
                 on_session_id_assigned=self._make_id_persister(spec.thread_id),
             )
