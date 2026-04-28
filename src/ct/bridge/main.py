@@ -18,11 +18,32 @@ import sys
 import structlog
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import BotCommand
 
 from ct.bridge.bot import BridgeBot
 from ct.bridge.runner_client import RunnerPool
 from ct.config import load_settings
 from ct.store.db import Db
+
+
+# Shown in Telegram's `/` autocomplete dropdown. Order matters — Telegram
+# preserves it. Descriptions are capped at 256 chars; keep them short.
+BOT_COMMANDS: list[BotCommand] = [
+    BotCommand(command="new",         description="Start a new session (or pick a profile)"),
+    BotCommand(command="menu",        description="Action card for this topic"),
+    BotCommand(command="m",           description="Action card for this topic (short)"),
+    BotCommand(command="list",        description="Show active sessions"),
+    BotCommand(command="permissions", description="Show or change permission mode"),
+    BotCommand(command="model",       description="Show or live-swap the model"),
+    BotCommand(command="effort",      description="Show or set effort level"),
+    BotCommand(command="close",       description="Close this topic's session"),
+    BotCommand(command="save",        description="Save a project profile"),
+    BotCommand(command="profiles",    description="List saved profiles"),
+    BotCommand(command="defaults",    description="Show or set bot-wide defaults"),
+    BotCommand(command="macs",        description="List or manage registered runners"),
+    BotCommand(command="status",      description="Bot uptime + runners + sessions"),
+    BotCommand(command="help",        description="Show usage"),
+]
 
 
 def _configure_logging(level: str, fmt: str) -> None:
@@ -113,6 +134,12 @@ async def _run() -> int:
     )
 
     me = await bot.get_me()
+    # Register the slash-command dropdown. Idempotent — safe to run on every
+    # boot. Default scope = applies to every chat the bot's in.
+    try:
+        await bot.set_my_commands(BOT_COMMANDS)
+    except Exception:
+        log.exception("bridge.set_commands_failed")  # non-fatal
     log.info(
         "bridge.starting",
         bot_username=me.username,
