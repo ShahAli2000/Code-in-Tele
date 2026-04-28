@@ -1643,6 +1643,13 @@ class BridgeBot:
                 request=req,
             )
 
+        # /restart spawns a fresh SDK process, so the in-memory remembered
+        # ledger is wiped. Reapply the bot-wide auto-allow list so the user
+        # doesn't have to re-tap "Always allow" for the same trusted tools.
+        allow_csv = (
+            self._defaults_cache.get("default_auto_allow_tools") or ""
+        ).strip()
+        allow_list = [t.strip() for t in allow_csv.split(",") if t.strip()]
         new_handle = await self.runners.get(session.runner_name).open_session(
             sid=str(thread_id),
             cwd=session.cwd,
@@ -1650,6 +1657,7 @@ class BridgeBot:
             model=session.model,
             effort=session.effort,
             resume=sdk_id,
+            auto_allow_tools=allow_list or None,
             on_permission_request=perm_handler,
             on_session_id_assigned=self._make_id_persister(thread_id),
         )
@@ -2515,6 +2523,15 @@ class BridgeBot:
                     fallback=self.default_runner,
                 )
                 runner_name = self.default_runner
+            # Re-apply the bot-wide auto-allow list on restore — restored
+            # sessions get a fresh in-memory _remembered_allows ledger, so
+            # without this step `/allow` settings only kick in for /new
+            # sessions, surprising users who've configured their pre-trust
+            # list and just restarted the bridge.
+            allow_csv = (
+                self._defaults_cache.get("default_auto_allow_tools") or ""
+            ).strip()
+            allow_list = [t.strip() for t in allow_csv.split(",") if t.strip()]
             handle = await self.runners.get(runner_name).open_session(
                 sid=str(spec.thread_id),
                 cwd=spec.cwd,
@@ -2522,6 +2539,7 @@ class BridgeBot:
                 resume=spec.sdk_session_id,
                 model=spec.model,
                 effort=spec.effort,
+                auto_allow_tools=allow_list or None,
                 on_permission_request=perm_handler,
                 on_session_id_assigned=self._make_id_persister(spec.thread_id),
             )
