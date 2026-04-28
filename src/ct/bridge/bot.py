@@ -1062,7 +1062,8 @@ class BridgeBot:
                 f"🌙 quiet hours\n"
                 f"start: {start}\n"
                 f"end:   {end}\n"
-                f"({active})\n\n"
+                f"({active})\n"
+                f"(times are local to the bridge host — Mac Studio)\n\n"
                 f"set:    /quiet 22:00 08:00\n"
                 f"clear:  /quiet off"
             )
