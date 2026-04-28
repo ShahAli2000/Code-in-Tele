@@ -14,6 +14,8 @@ dependencies = [
     "pydantic>=2.7",
     "structlog>=24.1",
     "python-dotenv>=1.0",
+    # Local audio transcription. Apple-Silicon-only — no-op on other platforms.
+    "mlx-whisper>=0.4.0; platform_machine == 'arm64' and sys_platform == 'darwin'",
 ]
 
 [dependency-groups]

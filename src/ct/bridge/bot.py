@@ -29,6 +29,7 @@ from aiogram.types import (
 )
 
 from ct.bridge import menu as menu_ui
+from ct.bridge import transcription
 from ct.bridge.permissions_ui import PermissionsUI
 from ct.bridge.runner_client import RunnerPool, SessionHandle
 from ct.bridge.sessions import RestoreSpec, SessionStore, TopicSession
@@ -1071,15 +1072,42 @@ class BridgeBot:
         )
         await message.answer(f"⬆ uploaded {size_str} → {resolved_path}")
 
+        # For audio, transcribe locally before synthesizing the prompt so
+        # Claude sees what was said. Off-loop via asyncio.to_thread.
+        transcript: str | None = None
+        if kind == "audio" and transcription.is_available():
+            await message.answer("🎙 transcribing…")
+            ext = ".ogg" if message.voice else f".{(suggested.rsplit('.', 1) + ['mp3'])[1]}"
+            try:
+                transcript = await transcription.transcribe_bytes(
+                    content, suffix=ext
+                )
+            except Exception as exc:
+                log.exception("transcribe.failed", thread_id=thread_id)
+                await message.answer(f"⚠ transcription failed: {exc!s}")
+            if transcript:
+                # Show the user what we heard, capped so very long ones don't
+                # blow up the chat
+                shown = transcript if len(transcript) <= 500 else transcript[:500] + "…"
+                await message.answer(f"📝 transcript:\n{shown}")
+
         # Synthesize a user message so Claude knows the file is there + sees
-        # the caption. For audio kinds, set expectations clearly.
+        # the caption. For audio with a transcript, the transcript is the
+        # primary message.
         caption = (message.caption or "").strip()
         if kind == "audio":
-            prompt = (
-                f"I uploaded an audio file at `{resolved_path}` ({size_str}).\n"
-                f"Note: you can't transcribe audio directly — it's saved if "
-                f"another tool needs it."
-            )
+            if transcript:
+                prompt = (
+                    f"(I sent a voice/audio message; transcribed locally.)\n"
+                    f"Audio file saved at `{resolved_path}` ({size_str}).\n"
+                    f"\nTranscript:\n{transcript}"
+                )
+            else:
+                prompt = (
+                    f"I uploaded an audio file at `{resolved_path}` "
+                    f"({size_str}). I couldn't transcribe it locally — "
+                    f"the file is saved if another tool needs it."
+                )
         else:
             prompt = (
                 f"I uploaded a file at `{resolved_path}` ({size_str}). "
