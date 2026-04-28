@@ -51,6 +51,31 @@ PermissionMode = Literal[
     "default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"
 ]
 
+# Appended to the SDK's default Claude Code system prompt for every bridge
+# session. Claude self-gates on whether the project is actually a git repo
+# (it'll run `git rev-parse` first) so this is a no-op for non-code chats.
+GIT_WORKFLOW_DIRECTIVE = """
+Git workflow for this session:
+- If the working directory is a git repository (check with `git rev-parse \
+--is-inside-work-tree`), commit your changes incrementally as you complete \
+coherent units of work — a feature implemented, a bug fixed, a refactor \
+stabilised. Don't wait until the end of the session.
+- Use conventional-commit-style messages: `feat: …`, `fix: …`, \
+`refactor: …`, `docs: …`, `chore: …`. One message per logical change, not \
+a wall of text.
+- Always `git add <specific paths>`. Never `git add -A` or `git add .` — \
+that risks sweeping in `.env`, build artifacts, or other things that \
+shouldn't be tracked.
+- Never `git push` without being explicitly asked. Local commits only \
+unless the user says otherwise.
+- If a change is unfinished or in flux, hold off committing until it \
+stabilises. Don't commit broken code "to save progress."
+- If unsure whether something warrants a commit, ask the user.
+- For non-code projects (no .git), skip this entirely — no commits, no \
+mention of git.
+"""
+
+
 
 @dataclass
 class PermissionRequest:
@@ -109,11 +134,24 @@ class SessionRunner:
         if self._client is not None:
             raise RuntimeError("SessionRunner already started")
 
+        # Compose the system prompt: keep Claude Code's default preset and
+        # APPEND our git-workflow directive (and any caller-supplied extra
+        # text). Using SystemPromptPreset rather than a plain string preserves
+        # Claude Code's full default behaviour — tool descriptions, planning
+        # heuristics, formatting guidance, etc.
+        append_parts: list[str] = [GIT_WORKFLOW_DIRECTIVE]
+        if self.system_prompt:
+            append_parts.append(self.system_prompt)
+        sdk_system_prompt: Any = {
+            "type": "preset",
+            "preset": "claude_code",
+            "append": "\n".join(append_parts).strip(),
+        }
         options_kwargs: dict[str, Any] = dict(
             cwd=self.cwd,
             permission_mode=self.permission_mode,
             resume=self.resume,
-            system_prompt=self.system_prompt,
+            system_prompt=sdk_system_prompt,
             can_use_tool=self._can_use_tool,
             # Isolate from the host's ~/.claude/settings.json. Without this, the
             # bridge inherits the user's `defaultMode`, hook bindings, plugin
