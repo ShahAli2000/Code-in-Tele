@@ -167,6 +167,11 @@ class BridgeBot:
         self.permissions_ui = PermissionsUI(bot, db)
         # ForceReply tracking — message_id -> {action, ...} for ad-hoc prompts.
         self._pending_replies: dict[int, dict[str, Any]] = {}
+        # Per-user pending action — fallback when the user types in General
+        # without explicitly replying to the bot's prompt. Same shape as
+        # _pending_replies; consumed on the user's next non-command text in
+        # General (or any topic with thread_id=GENERAL_TOPIC_ID/None).
+        self._pending_by_user: dict[int, dict[str, Any]] = {}
         # Browse-flow state per browse-card message_id.
         # Shape: {mac, path, main_dir, name, show_hidden, items: [(name, is_dir)]}
         self._browse_state: dict[int, dict[str, Any]] = {}
@@ -220,16 +225,13 @@ class BridgeBot:
         self._router.message.register(self.cmd_menu, Command("menu", "m"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
 
-        # Replies to bot ForceReply prompts (browse-flow new-folder, etc.) —
-        # registered BEFORE on_topic_message so a General reply lands here.
+        # Single text-message handler. Dispatches:
+        #   - explicit replies to bot ForceReply prompts
+        #   - per-user pending actions (no explicit reply needed)
+        #   - falls through to topic-message logic for normal conversation
         self._router.message.register(
-            self.on_pending_reply,
-            F.reply_to_message.is_not(None) & F.text.is_not(None),
-        )
-
-        self._router.message.register(
-            self.on_topic_message,
-            F.message_thread_id.is_not(None) & F.text.is_not(None) & ~F.text.startswith("/"),
+            self.on_text_message,
+            F.text.is_not(None) & ~F.text.startswith("/"),
         )
 
         self._router.callback_query.register(self.on_callback)
@@ -1247,14 +1249,17 @@ class BridgeBot:
             chat_id=self.settings.telegram_chat_id,
             text=(
                 f"➕ new folder under {state['mac']}:{state['path']}\n"
-                f"reply with the folder name (no slashes)"
+                f"send the folder name (no slashes). reply or just type."
             ),
-            reply_markup=ForceReply(selective=True),
+            reply_markup=ForceReply(),
         )
-        self._pending_replies[sent.message_id] = {
+        action = {
             "action": "new_folder",
             "browse_message_id": query.message.message_id,
         }
+        self._pending_replies[sent.message_id] = action
+        if query.from_user is not None:
+            self._pending_by_user[query.from_user.id] = action
         await query.answer("type a name…")
 
     async def _prompt_set_name(
@@ -1266,14 +1271,17 @@ class BridgeBot:
             chat_id=self.settings.telegram_chat_id,
             text=(
                 f"✏ session name (currently: {state['name']})\n"
-                f"reply with a custom name, or '-' to use the folder name"
+                f"send a custom name, or '-' to use the folder name."
             ),
-            reply_markup=ForceReply(selective=True),
+            reply_markup=ForceReply(),
         )
-        self._pending_replies[sent.message_id] = {
+        action = {
             "action": "set_name",
             "browse_message_id": query.message.message_id,
         }
+        self._pending_replies[sent.message_id] = action
+        if query.from_user is not None:
+            self._pending_by_user[query.from_user.id] = action
         await query.answer("type a name…")
 
     async def _confirm_open_browse(
@@ -1323,25 +1331,52 @@ class BridgeBot:
 
     # ---- ForceReply handler -----------------------------------------------
 
-    async def on_pending_reply(self, message: Message) -> None:
-        """Catches all text replies. If the parent message_id matches a
-        ForceReply prompt the bot sent, handle it. Otherwise fall through
-        to on_topic_message so normal topic conversation isn't swallowed."""
-        if message.reply_to_message is None:
-            return
-        parent_id = message.reply_to_message.message_id
-        pending = self._pending_replies.pop(parent_id, None)
-        if pending is None:
-            # Not one of our prompts — manually delegate so topic replies
-            # still flow into Claude (aiogram's first-match routing would
-            # otherwise stop here).
-            await self.on_topic_message(message)
-            return
+    async def on_text_message(self, message: Message) -> None:
+        """Universal text-message handler. Order:
+        1. Explicit reply to a ForceReply prompt → consume.
+        2. User has pending action AND message is in General → consume.
+        3. Otherwise → delegate to on_topic_message (Claude turn / no-op).
+        """
+        # 1. explicit reply
+        if message.reply_to_message is not None:
+            parent_id = message.reply_to_message.message_id
+            pending = self._pending_replies.pop(parent_id, None)
+            if pending is not None:
+                # Also clear the per-user fallback so we don't double-fire
+                if message.from_user is not None:
+                    self._pending_by_user.pop(message.from_user.id, None)
+                await self._dispatch_pending(message, pending)
+                return
+
+        # 2. per-user pending in General topic (or main chat)
+        in_general = (
+            message.message_thread_id is None
+            or message.message_thread_id == GENERAL_TOPIC_ID
+        )
+        if in_general and message.from_user is not None:
+            pending = self._pending_by_user.pop(message.from_user.id, None)
+            if pending is not None:
+                # Also remove any matching by-message-id pending entries
+                bmsg_id = pending.get("browse_message_id")
+                # (no easy reverse lookup; the by-message-id dict is keyed by
+                # the *prompt* message_id, not the browse card. Leave stale
+                # entries; they're harmless and get GC'd next time.)
+                await self._dispatch_pending(message, pending)
+                return
+
+        # 3. fall through to existing topic-message logic
+        await self.on_topic_message(message)
+
+    async def _dispatch_pending(
+        self, message: Message, pending: dict[str, Any]
+    ) -> None:
         action = pending.get("action")
         if action == "new_folder":
             await self._handle_new_folder_reply(message, pending)
         elif action == "set_name":
             await self._handle_set_name_reply(message, pending)
+        else:
+            log.warning("pending.unknown_action", action=action)
 
     async def _handle_new_folder_reply(
         self, message: Message, pending: dict[str, Any]
