@@ -61,6 +61,8 @@ class Settings:
     runner_port: int
     log_level: str
     log_format: str
+    dashboard_host: str   # bind address for the local web UI
+    dashboard_port: int   # port for the local web UI
     project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parents[2])
 
     def is_user_allowed(self, user_id: int) -> bool:
@@ -100,5 +102,7 @@ def load_settings(*, dotenv_path: Path | None = None, force: bool = False) -> Se
         runner_port=int(os.environ.get("CT_RUNNER_PORT", "8765")),
         log_level=os.environ.get("CT_LOG_LEVEL", "INFO").upper(),
         log_format=os.environ.get("CT_LOG_FORMAT", "console"),
+        dashboard_host=os.environ.get("CT_DASHBOARD_HOST", "127.0.0.1"),
+        dashboard_port=int(os.environ.get("CT_DASHBOARD_PORT", "8766")),
     )
     return _settings

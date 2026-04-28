@@ -370,6 +370,7 @@ class Db:
         "quiet_hours_start",   # HH:MM (24h, local TZ); empty = quiet hours off
         "quiet_hours_end",     # HH:MM (24h, local TZ)
         "default_auto_allow_tools",  # CSV of tool names to auto-approve at session start
+        "dashboard_token",      # static token for web-UI auth; auto-generated at first boot
     )
 
     async def get_default(self, key: str) -> str | None:

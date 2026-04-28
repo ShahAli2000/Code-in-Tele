@@ -23,6 +23,8 @@ from aiogram.types import BotCommand
 from ct.bridge.bot import BridgeBot
 from ct.bridge.runner_client import RunnerPool
 from ct.config import load_settings
+from ct.dashboard.auth import ensure_token
+from ct.dashboard.server import serve as serve_dashboard
 from ct.store.db import Db
 
 
@@ -46,6 +48,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="search",      description="Search past transcripts (/search <pattern>)"),
     BotCommand(command="stats",       description="Activity stats: turns, top tools, per-session"),
     BotCommand(command="allow",       description="Bot-wide pre-approved tools (auto-allow list)"),
+    BotCommand(command="tunnel",      description="Start/stop cloudflared tunnel for the web dashboard"),
     BotCommand(command="save",        description="Save a project profile"),
     BotCommand(command="profiles",    description="List saved profiles"),
     BotCommand(command="defaults",    description="Show or set bot-wide defaults"),
@@ -165,6 +168,21 @@ async def _run() -> int:
     expired = await bridge.expire_pending_approvals()
     log.info("bridge.ready", restored_sessions=restored, expired_approvals=expired)
 
+    # Start the local web dashboard. Token is generated on first boot and
+    # persisted, so URLs the user has bookmarked keep working across restarts.
+    dashboard_token = await ensure_token(db)
+    bridge._defaults_cache["dashboard_token"] = dashboard_token
+    dashboard_runner = await serve_dashboard(
+        bridge=bridge,
+        host=settings.dashboard_host,
+        port=settings.dashboard_port,
+        token=dashboard_token,
+    )
+    log.info(
+        "dashboard.url",
+        local=f"http://{settings.dashboard_host}:{settings.dashboard_port}/?token={dashboard_token}",
+    )
+
     stop_event = asyncio.Event()
 
     def _on_signal(signum: int) -> None:
@@ -205,6 +223,10 @@ async def _run() -> int:
     except (asyncio.CancelledError, Exception):
         pass
 
+    # Tunnel must die before the dashboard server — otherwise cloudflared
+    # keeps proxying to a port nothing's listening on.
+    await bridge._tunnel.stop()
+    await dashboard_runner.cleanup()
     await bridge.shutdown()
     await bot.session.close()
     await db.close()

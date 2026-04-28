@@ -38,6 +38,7 @@ from ct.bridge.sessions import RestoreSpec, SessionStore, TopicSession
 from ct.bridge.streaming import TopicRenderer
 from ct.bridge.topics import GENERAL_TOPIC_ID, create_topic
 from ct.config import Settings
+from ct.dashboard.tunnel import TunnelManager, public_url_with_token
 from ct.protocol.envelopes import (
     Envelope,
     T_SYSTEM,
@@ -183,6 +184,8 @@ class BridgeBot:
         # that hot-path checks (e.g. _is_quiet_now on every render) don't hit
         # SQLite per send.
         self._defaults_cache: dict[str, str | None] = {}
+        # Cloudflared tunnel for the dashboard. Lazy-spawned on /tunnel on.
+        self._tunnel = TunnelManager()
         # ForceReply tracking — message_id -> {action, ...} for ad-hoc prompts.
         self._pending_replies: dict[int, dict[str, Any]] = {}
         # Per-user pending action — fallback when the user types in General
@@ -255,6 +258,7 @@ class BridgeBot:
         self._router.message.register(self.cmd_search, Command("search"))
         self._router.message.register(self.cmd_stats, Command("stats"))
         self._router.message.register(self.cmd_allow, Command("allow"))
+        self._router.message.register(self.cmd_tunnel, Command("tunnel"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
 
         # Single text-message handler. Dispatches:
@@ -308,6 +312,7 @@ class BridgeBot:
             "  /search <pattern>    — substring search across all past transcripts\n"
             "  /stats               — turns, tool use, active sessions (from message_log)\n"
             "  /allow               — bot-wide auto-allow tool list (skip approval cards)\n"
+            "  /tunnel [on|off]     — expose the local dashboard via cloudflared\n"
             "  /macs [add|remove]   — manage registered runners\n"
             "  /status              — uptime, runners, sessions\n\n"
             "Just type in a topic to talk to Claude.\n"
@@ -1283,6 +1288,54 @@ class BridgeBot:
                 lines.append(f"  {tag:<24} {count:>5}  last: {ts_short}")
 
         await message.answer("\n".join(lines))
+
+    # ---- web dashboard tunnel --------------------------------------------
+
+    async def cmd_tunnel(self, message: Message) -> None:
+        """/tunnel on | off | status — control the cloudflared subprocess
+        that exposes the local dashboard to the public internet via a
+        trycloudflare.com URL.
+
+        Quick Tunnels are anonymous + ephemeral. The token in the URL is
+        the only auth — guard the link like a password."""
+        text = (message.text or "").strip().split()
+        verb = text[1].lower() if len(text) >= 2 else "status"
+
+        if verb == "status":
+            await message.answer(self._tunnel.status_text())
+            return
+
+        if verb in ("on", "start"):
+            if self._tunnel.is_running:
+                await message.answer(self._tunnel.status_text())
+                return
+            await message.answer("⏳ starting tunnel …")
+            try:
+                public = await self._tunnel.start(
+                    local_port=self.settings.dashboard_port,
+                )
+            except Exception as exc:
+                log.exception("tunnel.start_failed")
+                await message.answer(f"⚠ tunnel failed: {exc!s}")
+                return
+            token = self._defaults_cache.get("dashboard_token") or ""
+            url_with_token = public_url_with_token(public, token) or public
+            await message.answer(
+                f"🌐 tunnel up\n{public}\n\n"
+                f"with token (open this):\n{url_with_token}\n\n"
+                f"⚠ this URL is publicly reachable; the token is the only auth."
+            )
+            return
+
+        if verb in ("off", "stop"):
+            if not self._tunnel.is_running:
+                await message.answer("💤 tunnel was already off.")
+                return
+            await self._tunnel.stop()
+            await message.answer("💤 tunnel stopped.")
+            return
+
+        await message.answer("usage: /tunnel [on | off | status]")
 
     async def cmd_status(self, message: Message) -> None:
         """Snapshot of bot health: uptime, runner connectivity, active sessions."""
