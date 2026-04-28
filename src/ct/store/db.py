@@ -56,6 +56,10 @@ class ProfileRow:
     permission_mode: str | None
     created_at: str
     updated_at: str
+    # Free-form text appended to Claude Code's system prompt. Lets a profile
+    # carry project-specific instructions (e.g. "you're working on a Rust
+    # codebase, prefer cargo over python idioms").
+    system_prompt: str | None = None
 
 
 @dataclass
@@ -111,6 +115,12 @@ class Db:
         if "main_dir" not in mac_cols:
             await self.conn.execute("ALTER TABLE macs ADD COLUMN main_dir TEXT")
             log.info("db.migrated", change="macs.main_dir added")
+
+        async with self.conn.execute("PRAGMA table_info(profiles)") as cur:
+            profile_cols = {row[1] for row in await cur.fetchall()}
+        if "system_prompt" not in profile_cols:
+            await self.conn.execute("ALTER TABLE profiles ADD COLUMN system_prompt TEXT")
+            log.info("db.migrated", change="profiles.system_prompt added")
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -292,6 +302,21 @@ class Db:
         )
         await self.conn.commit()
 
+    async def update_profile_system_prompt(
+        self, name: str, system_prompt: str | None
+    ) -> bool:
+        """Set or clear the per-profile system_prompt fragment. Edited
+        independently of the rest of the profile because the text is usually
+        too long to pass through `/save name dir=…` flag-style syntax."""
+        async with self.conn.execute(
+            "UPDATE profiles SET system_prompt = ?, updated_at = datetime('now') "
+            "WHERE name = ?",
+            (system_prompt, name),
+        ) as cur:
+            updated = cur.rowcount or 0
+        await self.conn.commit()
+        return updated > 0
+
     async def delete_profile(self, name: str) -> bool:
         async with self.conn.execute(
             "DELETE FROM profiles WHERE name = ?", (name,)
@@ -303,7 +328,7 @@ class Db:
     async def get_profile(self, name: str) -> ProfileRow | None:
         async with self.conn.execute(
             "SELECT name, dir, runner_name, model, effort, permission_mode, "
-            "created_at, updated_at FROM profiles WHERE name = ?",
+            "created_at, updated_at, system_prompt FROM profiles WHERE name = ?",
             (name,),
         ) as cur:
             row = await cur.fetchone()
@@ -312,7 +337,7 @@ class Db:
     async def list_profiles(self) -> list[ProfileRow]:
         async with self.conn.execute(
             "SELECT name, dir, runner_name, model, effort, permission_mode, "
-            "created_at, updated_at FROM profiles ORDER BY name"
+            "created_at, updated_at, system_prompt FROM profiles ORDER BY name"
         ) as cur:
             rows = await cur.fetchall()
         return [ProfileRow(*r) for r in rows]

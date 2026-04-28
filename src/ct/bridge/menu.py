@@ -435,7 +435,14 @@ async def _format_profile_one(profile) -> str:
     if profile.effort: bits.append(f"effort={profile.effort}")
     if profile.permission_mode: bits.append(f"mode={profile.permission_mode}")
     body = "\n".join(f"  {b}" for b in bits) or "  (no fields set; uses defaults)"
-    return f"📁 {profile.name}\n{body}"
+    out = f"📁 {profile.name}\n{body}"
+    sp = getattr(profile, "system_prompt", None)
+    if sp:
+        preview = sp.strip()
+        if len(preview) > 280:
+            preview = preview[:277] + "…"
+        out += f"\n\nsystem prompt:\n{preview}"
+    return out
 
 
 def _profiles_list_keyboard(profiles) -> InlineKeyboardMarkup:
@@ -481,6 +488,11 @@ async def handle_profiles_callback(query: CallbackQuery, *, db, bot: Bot) -> boo
     rest = data[len(PROFILES_PREFIX):]
     parts = rest.split(":", 1)
     verb = parts[0]
+    # "setprompt" is owned by bot.py because it needs to register a pending
+    # ForceReply action. Returning False here lets the dispatcher chain
+    # continue to the bot's handler.
+    if verb == "setprompt":
+        return False
     if verb == "back":
         profiles = await db.list_profiles()
         await _safe_edit(
@@ -499,10 +511,18 @@ async def handle_profiles_callback(query: CallbackQuery, *, db, bot: Bot) -> boo
             bot, query,
             text=await _format_profile_one(profile)
                 + "\n\nuse /save with same name to edit, or /new to start.",
-            keyboard=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🗑 delete", callback_data=PROFILES_PREFIX + f"rm:{name}"),
-                InlineKeyboardButton(text="← back", callback_data=PROFILES_PREFIX + "back"),
-            ]]),
+            keyboard=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✏ edit prompt",
+                        callback_data=PROFILES_PREFIX + f"setprompt:{name}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(text="🗑 delete", callback_data=PROFILES_PREFIX + f"rm:{name}"),
+                    InlineKeyboardButton(text="← back", callback_data=PROFILES_PREFIX + "back"),
+                ],
+            ]),
         )
         await query.answer()
         return True

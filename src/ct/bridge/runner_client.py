@@ -672,6 +672,7 @@ class RunnerConnection:
         resume: str | None = None,
         model: str | None = None,
         effort: str | None = None,
+        system_prompt: str | None = None,
         on_permission_request: PermissionHandler | None = None,
         on_session_id_assigned: SdkIdHandler | None = None,
     ) -> SessionHandle:
@@ -691,7 +692,10 @@ class RunnerConnection:
         await self._send(
             Envelope(
                 T_OPEN, sid,
-                open_payload(cwd=cwd, mode=mode, resume=resume, model=model, effort=effort),
+                open_payload(
+                    cwd=cwd, mode=mode, resume=resume, model=model, effort=effort,
+                    system_prompt=system_prompt,
+                ),
             )
         )
         try:

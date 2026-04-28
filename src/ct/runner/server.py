@@ -416,6 +416,7 @@ class RunnerConnection:
         resume = env.payload.get("resume")
         model = env.payload.get("model")
         effort = env.payload.get("effort")
+        system_prompt = env.payload.get("system_prompt")
         if not isinstance(cwd, str) or not cwd:
             await self._send_error(env.id, "bad_request", "cwd is required")
             return
@@ -446,6 +447,7 @@ class RunnerConnection:
             resume=resume,
             model=model if isinstance(model, str) else None,
             effort=effort if isinstance(effort, str) else None,
+            system_prompt=system_prompt if isinstance(system_prompt, str) else None,
             on_permission_request=perm_handler,
             on_session_id_assigned=id_persister,
         )

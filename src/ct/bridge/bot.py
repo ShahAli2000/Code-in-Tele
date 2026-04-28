@@ -142,6 +142,10 @@ class ResolvedSession:
     model: str | None
     effort: str | None
     permission_mode: str
+    # Free-form system-prompt fragment carried by the profile (when /new uses
+    # one). Appended to Claude Code's default + git/test directives at session
+    # open. None when not set or no profile was used.
+    system_prompt: str | None = None
 
 
 class BridgeBot:
@@ -515,6 +519,7 @@ class BridgeBot:
             model=model,
             effort=effort,
             permission_mode=mode,
+            system_prompt=profile.system_prompt if profile else None,
         )
 
     async def cmd_new(self, message: Message) -> None:
@@ -975,6 +980,7 @@ class BridgeBot:
                 model=resolved.model,
                 effort=resolved.effort,
                 resume=resume,
+                system_prompt=resolved.system_prompt,
                 on_permission_request=perm_handler,
                 on_session_id_assigned=self._make_id_persister(thread_id),
             )
@@ -1707,6 +1713,8 @@ class BridgeBot:
             return
         if await menu_ui.handle_profiles_callback(query, db=self.db, bot=self.bot):
             return
+        if await self._handle_profile_setprompt_callback(query):
+            return
         if await self._handle_browse_callback(query):
             return
         if await self._handle_new_menu_callback(query):
@@ -1920,6 +1928,63 @@ class BridgeBot:
             self._pending_by_user[query.from_user.id] = action
         await query.answer("type a name…")
 
+    async def _handle_profile_setprompt_callback(self, query: CallbackQuery) -> bool:
+        """Owned by bot.py (not menu_ui) because it needs to register a
+        ForceReply pending action — the user types the actual prompt as a
+        normal message after tapping the button."""
+        data = query.data or ""
+        if not data.startswith(menu_ui.PROFILES_PREFIX + "setprompt:"):
+            return False
+        name = data[len(menu_ui.PROFILES_PREFIX + "setprompt:") :]
+        profile = await self.db.get_profile(name)
+        if profile is None:
+            await query.answer("profile no longer exists")
+            return True
+        existing = (profile.system_prompt or "").strip()
+        existing_preview = (
+            f"current:\n{existing[:200]}{'…' if len(existing) > 200 else ''}\n\n"
+            if existing else ""
+        )
+        sent = await self.bot.send_message(
+            chat_id=self.settings.telegram_chat_id,
+            text=(
+                f"✏ system prompt for profile {name!r}\n\n"
+                f"{existing_preview}"
+                f"reply with the new prompt, or 'off' to clear it. "
+                f"this is appended to Claude Code's default + git/test directives."
+            ),
+            reply_markup=ForceReply(),
+        )
+        action = {"action": "set_profile_prompt", "profile_name": name}
+        self._pending_replies[sent.message_id] = action
+        if query.from_user is not None:
+            self._pending_by_user[query.from_user.id] = action
+        await query.answer("type the prompt…")
+        return True
+
+    async def _handle_set_profile_prompt_reply(
+        self, message: Message, pending: dict[str, Any]
+    ) -> None:
+        name = pending.get("profile_name")
+        if not name:
+            await message.answer("⚠ pending action lost the profile name — try again")
+            return
+        text = (message.text or "").strip()
+        clear = text.lower() == "off" or text == ""
+        ok = await self.db.update_profile_system_prompt(
+            name, None if clear else text
+        )
+        if not ok:
+            await message.answer(f"⚠ profile {name!r} no longer exists")
+            return
+        if clear:
+            await message.answer(f"✓ system prompt cleared for {name!r}")
+        else:
+            preview = text[:120] + ("…" if len(text) > 120 else "")
+            await message.answer(
+                f"✓ system prompt set for {name!r}\n\npreview:\n{preview}"
+            )
+
     async def _prompt_set_name(
         self, query: CallbackQuery, state: dict[str, Any]
     ) -> None:
@@ -2033,6 +2098,8 @@ class BridgeBot:
             await self._handle_new_folder_reply(message, pending)
         elif action == "set_name":
             await self._handle_set_name_reply(message, pending)
+        elif action == "set_profile_prompt":
+            await self._handle_set_profile_prompt_reply(message, pending)
         else:
             log.warning("pending.unknown_action", action=action)
 
