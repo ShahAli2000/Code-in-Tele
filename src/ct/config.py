@@ -102,7 +102,10 @@ def load_settings(*, dotenv_path: Path | None = None, force: bool = False) -> Se
         runner_port=int(os.environ.get("CT_RUNNER_PORT", "8765")),
         log_level=os.environ.get("CT_LOG_LEVEL", "INFO").upper(),
         log_format=os.environ.get("CT_LOG_FORMAT", "console"),
-        dashboard_host=os.environ.get("CT_DASHBOARD_HOST", "127.0.0.1"),
+        # Default binds all interfaces so Tailscale-connected devices can reach
+        # the dashboard. The token is the auth; tighten via CT_DASHBOARD_HOST=
+        # 127.0.0.1 if you want strictly-local + only-via-/tunnel exposure.
+        dashboard_host=os.environ.get("CT_DASHBOARD_HOST", "0.0.0.0"),
         dashboard_port=int(os.environ.get("CT_DASHBOARD_PORT", "8766")),
     )
     return _settings
