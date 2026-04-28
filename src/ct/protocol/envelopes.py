@@ -44,10 +44,10 @@ T_PONG = "pong"               # heartbeat reply
 ALL_TYPES: frozenset[str] = frozenset({
     T_OPEN, T_SEND, T_DECIDE, T_SET_MODE, T_INTERRUPT, T_CLOSE, T_PING,
     "set_model",
-    "list_dir", "mkdir",
+    "list_dir", "mkdir", "upload",
     T_OPENED, T_SDK_ID, T_TEXT, T_TOOL_USE, T_TOOL_RESULT, T_THINKING,
     T_SYSTEM, T_PERMISSION_REQUEST, T_TURN_END, T_CLOSED, T_ERROR, T_PONG,
-    "dir_listing", "mkdir_ok",
+    "dir_listing", "mkdir_ok", "upload_ok",
 })
 
 
@@ -147,6 +147,11 @@ T_DIR_LISTING = "dir_listing"      # runner → bridge: payload {path, items: [{
 T_MKDIR = "mkdir"                  # bridge → runner: payload {path}
 T_MKDIR_OK = "mkdir_ok"            # runner → bridge: payload {path}
 
+# Phase 8 — uploads. Bridge ships bytes to runner so files end up on the
+# runner's filesystem regardless of which mac it lives on.
+T_UPLOAD = "upload"                # bridge → runner: payload {path, content_b64}
+T_UPLOAD_OK = "upload_ok"          # runner → bridge: payload {path, size}
+
 
 def list_dir_payload(path: str, show_hidden: bool = False) -> dict[str, Any]:
     return {"path": path, "show_hidden": show_hidden}
@@ -162,6 +167,14 @@ def mkdir_payload(path: str) -> dict[str, Any]:
 
 def mkdir_ok_payload(path: str) -> dict[str, Any]:
     return {"path": path}
+
+
+def upload_payload(path: str, content_b64: str) -> dict[str, Any]:
+    return {"path": path, "content_b64": content_b64}
+
+
+def upload_ok_payload(path: str, size: int) -> dict[str, Any]:
+    return {"path": path, "size": size}
 
 
 def send_payload(text: str) -> dict[str, Any]:

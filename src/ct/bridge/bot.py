@@ -9,6 +9,8 @@ itself never imports the SDK directly.
 from __future__ import annotations
 
 import asyncio
+import io
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -233,6 +235,12 @@ class BridgeBot:
             self.on_text_message,
             F.text.is_not(None) & ~F.text.startswith("/"),
         )
+
+        # Media handlers — photo, document, voice, audio. Each sends through
+        # the same on_media_message; aiogram needs separate registrations
+        # because F.photo / F.document / etc. don't combine cleanly with `|`.
+        for media_filter in (F.photo, F.document, F.voice, F.audio):
+            self._router.message.register(self.on_media_message, media_filter)
 
         self._router.callback_query.register(self.on_callback)
 
@@ -991,6 +999,106 @@ class BridgeBot:
         await message.answer("✓ session closed. (topic remains; you can keep history.)")
 
     # ---- topic-text handler -------------------------------------------------
+
+    # ---- media uploads (photo / document / voice / audio) -----------------
+
+    _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+    async def on_media_message(self, message: Message) -> None:
+        thread_id = message.message_thread_id
+        if thread_id is None or thread_id == GENERAL_TOPIC_ID:
+            await message.answer(
+                "uploads need a session topic — open one with /new first."
+            )
+            return
+        session = self.sessions.get(thread_id)
+        if session is None:
+            await message.answer("⚠ no session in this topic")
+            return
+
+        # Resolve the media kind, file_id, suggested filename
+        file_id: str | None = None
+        suggested: str = ""
+        kind: str = ""
+        if message.photo:
+            file_id = message.photo[-1].file_id  # largest variant
+            suggested = "photo.jpg"
+            kind = "image"
+        elif message.document:
+            file_id = message.document.file_id
+            suggested = message.document.file_name or "document.bin"
+            kind = "document"
+        elif message.voice:
+            file_id = message.voice.file_id
+            suggested = "voice.ogg"
+            kind = "audio"
+        elif message.audio:
+            file_id = message.audio.file_id
+            suggested = message.audio.file_name or "audio.mp3"
+            kind = "audio"
+        if file_id is None:
+            return
+
+        # Download from Telegram
+        try:
+            tg_file = await self.bot.get_file(file_id)
+            buf = io.BytesIO()
+            await self.bot.download_file(tg_file.file_path, buf)
+            content = buf.getvalue()
+        except Exception as exc:
+            log.exception("media.download_failed", thread_id=thread_id)
+            await message.answer(f"⚠ couldn't download from Telegram: {exc!s}")
+            return
+
+        # Build target path under <cwd>/_uploads/
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        safe = self._SAFE_NAME_RE.sub("_", suggested) or "file"
+        target_path = str(Path(session.cwd) / "_uploads" / f"{ts}-{safe}")
+
+        # Ship to the runner's filesystem (works for both local studio + remote
+        # macs because RunnerConnection.upload_file goes over the WS).
+        try:
+            resolved_path, size = await session.runner.upload_file(target_path, content)
+        except Exception as exc:
+            log.exception("media.upload_to_runner_failed", thread_id=thread_id)
+            await message.answer(f"⚠ upload to runner {session.runner_name!r} failed: {exc!s}")
+            return
+
+        size_str = (
+            f"{size:,} B" if size < 1024 else
+            f"{size/1024:.1f} KB" if size < 1024 * 1024 else
+            f"{size/1024/1024:.1f} MB"
+        )
+        await message.answer(f"⬆ uploaded {size_str} → {resolved_path}")
+
+        # Synthesize a user message so Claude knows the file is there + sees
+        # the caption. For audio kinds, set expectations clearly.
+        caption = (message.caption or "").strip()
+        if kind == "audio":
+            prompt = (
+                f"I uploaded an audio file at `{resolved_path}` ({size_str}).\n"
+                f"Note: you can't transcribe audio directly — it's saved if "
+                f"another tool needs it."
+            )
+        else:
+            prompt = (
+                f"I uploaded a file at `{resolved_path}` ({size_str}). "
+                f"Use the Read tool to look at it."
+            )
+        if caption:
+            prompt += f"\n\nCaption: {caption}"
+
+        # Run a turn so Claude responds to the upload
+        renderer = TopicRenderer(self.bot, self.settings.telegram_chat_id, thread_id)
+        async with session.turn_lock:
+            try:
+                async for env in session.runner.turn(prompt):
+                    await self._dispatch_envelope(env, renderer)
+            except Exception as exc:
+                log.exception("media.turn_failed", thread_id=thread_id)
+                await renderer.render_error(f"turn failed: {exc!r}")
+            else:
+                await self.sessions.touch(thread_id)
 
     async def on_topic_message(self, message: Message) -> None:
         thread_id = message.message_thread_id

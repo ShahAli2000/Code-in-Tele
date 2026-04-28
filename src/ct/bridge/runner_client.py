@@ -29,6 +29,7 @@ Public surface used by the bridge:
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -51,6 +52,8 @@ from ct.protocol.envelopes import (
     T_LIST_DIR,
     T_MKDIR,
     T_MKDIR_OK,
+    T_UPLOAD,
+    T_UPLOAD_OK,
     T_OPEN,
     T_OPENED,
     T_PERMISSION_REQUEST,
@@ -66,6 +69,7 @@ from ct.protocol.envelopes import (
     decide_payload,
     list_dir_payload,
     mkdir_payload,
+    upload_payload,
     open_payload,
     send_payload,
     set_mode_payload,
@@ -194,6 +198,11 @@ class SessionHandle:
     @property
     def effort(self) -> str | None:
         return self._state.effort
+
+    async def upload_file(self, path: str, content: bytes) -> tuple[str, int]:
+        """Convenience: ship bytes to the runner. Used by the bridge's media
+        handlers so /new mac=laptop sessions can receive uploads from Telegram."""
+        return await self._conn.upload_file(path, content)
 
     async def interrupt(self) -> None:
         await self._conn._send(Envelope(T_INTERRUPT, self.sid, {}))
@@ -536,6 +545,24 @@ class RunnerConnection:
                 f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
             )
         return env.payload.get("path", path)
+
+    async def upload_file(self, path: str, content: bytes) -> tuple[str, int]:
+        """Write `content` to `path` on the runner. Parent dirs are created if
+        missing. Returns (resolved_path, size). Raises on error.
+
+        Uploads are base64-encoded inside the JSON envelope. For larger files
+        this could be replaced with a binary WS frame; current implementation
+        is fine for ≤ 20 MB (Telegram bot file limit)."""
+        b64 = base64.b64encode(content).decode("ascii")
+        env = await self._call_rpc(
+            T_UPLOAD, upload_payload(path, b64),
+            timeout=60.0,  # upload can take longer for large files
+        )
+        if env.type == T_ERROR:
+            raise RuntimeError(
+                f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
+            )
+        return env.payload.get("path", path), int(env.payload.get("size", len(content)))
 
     async def open_session(
         self,

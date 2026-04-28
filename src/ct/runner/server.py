@@ -29,6 +29,7 @@ Session lifecycle (Phase 2):
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import logging
 import os
@@ -67,6 +68,8 @@ from ct.protocol.envelopes import (
     T_LIST_DIR,
     T_MKDIR,
     T_MKDIR_OK,
+    T_UPLOAD,
+    T_UPLOAD_OK,
     T_OPEN,
     T_OPENED,
     T_PERMISSION_REQUEST,
@@ -85,6 +88,7 @@ from ct.protocol.envelopes import (
     dir_listing_payload,
     error_payload,
     mkdir_ok_payload,
+    upload_ok_payload,
     permission_request_payload,
     sdk_id_payload,
     system_payload,
@@ -261,6 +265,8 @@ class RunnerConnection:
                 await self._handle_list_dir(env)
             elif env.type == T_MKDIR:
                 await self._handle_mkdir(env)
+            elif env.type == T_UPLOAD:
+                await self._handle_upload(env)
             else:
                 await self._send_error(env.id, "unsupported_type", env.type)
         except Exception as exc:
@@ -474,6 +480,34 @@ class RunnerConnection:
             await self._send_error(env.id, "io_error", str(exc))
             return
         await self._send(Envelope(T_MKDIR_OK, env.id, mkdir_ok_payload(str(path))))
+
+    async def _handle_upload(self, env: Envelope) -> None:
+        path_raw = env.payload.get("path")
+        content_b64 = env.payload.get("content_b64")
+        if not isinstance(path_raw, str) or not path_raw:
+            await self._send_error(env.id, "bad_request", "upload.path required")
+            return
+        if not isinstance(content_b64, str):
+            await self._send_error(env.id, "bad_request", "upload.content_b64 required")
+            return
+        try:
+            data = base64.b64decode(content_b64, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            await self._send_error(env.id, "bad_b64", str(exc))
+            return
+        path = pathlib.Path(path_raw).expanduser()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        except PermissionError as exc:
+            await self._send_error(env.id, "permission_denied", str(exc))
+            return
+        except OSError as exc:
+            await self._send_error(env.id, "io_error", str(exc))
+            return
+        await self._send(
+            Envelope(T_UPLOAD_OK, env.id, upload_ok_payload(str(path), len(data)))
+        )
 
     async def _handle_close(self, env: Envelope) -> None:
         session = self.sessions.pop(env.id, None)
