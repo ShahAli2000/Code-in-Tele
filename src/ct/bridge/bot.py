@@ -383,20 +383,70 @@ class BridgeBot:
                 f"⚠ {name!r} has active sessions ({names}); /close them first."
             )
             return
-        try:
-            conn = self.runners.get(name)
-        except KeyError:
-            removed_db = await self.db.remove_mac(name)
-            if removed_db:
-                await message.answer(f"✓ {name} removed (was in DB but not connected).")
-            else:
-                await message.answer(f"⚠ no runner registered as {name!r}.")
-            return
-        await conn.close()
-        # Drop from pool and DB
-        self.runners._connections.pop(name, None)  # type: ignore[attr-defined]
-        await self.db.remove_mac(name)
-        await message.answer(f"✓ {name} disconnected and removed.")
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        await message.answer(
+            f"🛑 remove runner {name!r}?\n\n"
+            f"this disconnects the WebSocket and drops the row from the DB. "
+            f"any sessions whose runner_name = {name!r} (currently none) "
+            f"would be orphaned. you can re-add later with /macs add.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="✓ yes, remove",
+                    callback_data=f"ct:mr:yes:{name}",
+                ),
+                InlineKeyboardButton(text="✗ cancel", callback_data="ct:mr:no"),
+            ]]),
+        )
+
+    async def _handle_macs_remove_callback(self, query: CallbackQuery) -> bool:
+        data = query.data or ""
+        if not data.startswith("ct:mr:"):
+            return False
+        rest = data[len("ct:mr:") :]
+        if rest == "no":
+            await menu_ui._safe_edit(
+                self.bot, query, text="✗ remove cancelled", keyboard=None,
+            )
+            await query.answer("cancelled")
+            return True
+        if rest.startswith("yes:"):
+            name = rest[len("yes:"):]
+            if name == self.default_runner:
+                await query.answer("can't remove the local runner")
+                return True
+            # Re-check guards (state may have changed between prompt and tap)
+            bound = [s for s in self.sessions.all() if s.runner_name == name]
+            if bound:
+                await menu_ui._safe_edit(
+                    self.bot, query,
+                    text=f"⚠ {name!r} has active sessions now; /close first.",
+                    keyboard=None,
+                )
+                await query.answer()
+                return True
+            try:
+                conn = self.runners.get(name)
+            except KeyError:
+                removed_db = await self.db.remove_mac(name)
+                msg = (
+                    f"✓ {name} removed (was in DB but not connected)"
+                    if removed_db else f"⚠ no runner registered as {name!r}"
+                )
+                await menu_ui._safe_edit(self.bot, query, text=msg, keyboard=None)
+                await query.answer()
+                return True
+            await conn.close()
+            self.runners._connections.pop(name, None)  # type: ignore[attr-defined]
+            await self.db.remove_mac(name)
+            await menu_ui._safe_edit(
+                self.bot, query,
+                text=f"✓ {name} disconnected and removed",
+                keyboard=None,
+            )
+            await query.answer("removed")
+            return True
+        await query.answer()
+        return True
 
     async def _resolve_for_new(self, args: ParsedArgs) -> "ResolvedSession":
         """Apply precedence: explicit args > profile > bot defaults > hard-coded fallback."""
@@ -991,13 +1041,58 @@ class BridgeBot:
         if session is None:
             await message.answer("no session in this topic.")
             return
-        self.permissions_ui.cancel_pending_for(session.runner)
-        try:
-            await session.runner.close()
-        except Exception:
-            log.exception("session.close_failed", thread_id=session.thread_id)
-        await self.sessions.close(session.thread_id)
-        await message.answer("✓ session closed. (topic remains; you can keep history.)")
+        # Confirm before tearing down — destructive (kills the live SDK
+        # connection; the topic stays but talking in it needs a /new).
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        await message.answer(
+            f"🛑 close session {session.project_name!r}?\n\n"
+            f"the topic will stay in Telegram with its history, but "
+            f"you'd need /new to start a new session in it.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="✓ yes, close",
+                    callback_data=f"ct:cc:yes:{session.thread_id}",
+                ),
+                InlineKeyboardButton(text="✗ cancel", callback_data="ct:cc:no"),
+            ]]),
+        )
+
+    async def _handle_close_confirm_callback(self, query: CallbackQuery) -> bool:
+        data = query.data or ""
+        if not data.startswith("ct:cc:"):
+            return False
+        rest = data[len("ct:cc:") :]
+        if rest == "no":
+            await menu_ui._safe_edit(
+                self.bot, query, text="✗ close cancelled", keyboard=None,
+            )
+            await query.answer("cancelled")
+            return True
+        if rest.startswith("yes:"):
+            try:
+                thread_id = int(rest[len("yes:"):])
+            except ValueError:
+                await query.answer("malformed")
+                return True
+            session = self.sessions.get(thread_id)
+            if session is None:
+                await menu_ui._safe_edit(
+                    self.bot, query,
+                    text="⚠ session no longer exists",
+                    keyboard=None,
+                )
+                await query.answer()
+                return True
+            await self._close_session_via_menu(session)
+            await menu_ui._safe_edit(
+                self.bot, query,
+                text=f"✓ session {session.project_name!r} closed",
+                keyboard=None,
+            )
+            await query.answer("closed")
+            return True
+        await query.answer()
+        return True
 
     # ---- topic-text handler -------------------------------------------------
 
@@ -1194,6 +1289,10 @@ class BridgeBot:
         if await self._handle_browse_callback(query):
             return
         if await self._handle_new_menu_callback(query):
+            return
+        if await self._handle_close_confirm_callback(query):
+            return
+        if await self._handle_macs_remove_callback(query):
             return
         await query.answer()
 

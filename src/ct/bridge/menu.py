@@ -221,6 +221,22 @@ async def handle_callback(
         await query.answer(f"{field} → {value}")
         return True
     if verb == "close":
+        # First tap: show confirmation in place rather than closing immediately.
+        await _safe_edit(
+            bot, query,
+            text=(
+                f"🛑 close session {session.project_name!r}?\n\n"
+                f"the topic stays in Telegram. you'd need /new to talk to "
+                f"Claude here again."
+            ),
+            keyboard=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✓ yes, close", callback_data=_cb(sid, "close_yes")),
+                InlineKeyboardButton(text="✗ cancel", callback_data=_cb(sid, "back")),
+            ]]),
+        )
+        await query.answer()
+        return True
+    if verb == "close_yes":
         await on_close(session)
         await _safe_edit(
             bot, query,
