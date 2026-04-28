@@ -167,6 +167,9 @@ class BridgeBot:
         self.permissions_ui = PermissionsUI(bot, db)
         # ForceReply tracking — message_id -> {action, ...} for ad-hoc prompts.
         self._pending_replies: dict[int, dict[str, Any]] = {}
+        # Browse-flow state per browse-card message_id.
+        # Shape: {mac, path, main_dir, name, show_hidden, items: [(name, is_dir)]}
+        self._browse_state: dict[int, dict[str, Any]] = {}
         self.dp = Dispatcher()
         self._router = Router()
         self._wire_middleware_and_handlers()
@@ -1063,12 +1066,18 @@ class BridgeBot:
         if not data.startswith(menu_ui.BROWSE_PREFIX):
             return False
         rest = data[len(menu_ui.BROWSE_PREFIX) :]
-        parts = rest.split(":")
+        parts = rest.split(":", 1)
         verb = parts[0]
 
         if verb == "back":
-            # Re-render /new menu in place
+            # discard browse state for this message and return to /new menu
+            if query.message is not None:
+                self._browse_state.pop(query.message.message_id, None)
             await self._edit_to_new_menu(query)
+            await query.answer()
+            return True
+
+        if verb == "noop":
             await query.answer()
             return True
 
@@ -1078,7 +1087,7 @@ class BridgeBot:
                 await query.answer("no runners registered", show_alert=True)
                 return True
             if len(names) == 1:
-                await self._show_browse_listing(query, names[0], show_hidden=False)
+                await self._begin_browse(query, names[0], show_hidden=False)
             else:
                 await menu_ui._safe_edit(
                     self.bot, query,
@@ -1090,25 +1099,67 @@ class BridgeBot:
 
         if verb == "m" and len(parts) >= 2:
             mac_name = parts[1]
-            show_hidden = (len(parts) >= 3 and parts[2] == "h")
-            await self._show_browse_listing(query, mac_name, show_hidden=show_hidden)
+            await self._begin_browse(query, mac_name, show_hidden=False)
             return True
 
-        if verb == "o" and len(parts) >= 3:
-            mac_name = parts[1]
-            folder = ":".join(parts[2:])  # rejoin in case folder name had colons (rare)
-            await self._open_session_in_folder(query, mac_name, folder, source="browse")
+        # Past this point, all verbs operate on the per-message browse state.
+        if query.message is None:
+            await query.answer("no message")
+            return True
+        state = self._browse_state.get(query.message.message_id)
+        if state is None:
+            await query.answer("browse session expired — tap [📂 browse] again", show_alert=True)
             return True
 
-        if verb == "n" and len(parts) >= 2:
-            mac_name = parts[1]
-            await self._prompt_new_folder(query, mac_name)
+        if verb == "cd" and len(parts) >= 2:
+            try:
+                idx = int(parts[1])
+            except ValueError:
+                await query.answer("bad index")
+                return True
+            dirs = [(n, is_dir) for n, is_dir in state["items"] if is_dir]
+            if not (0 <= idx < len(dirs)):
+                await query.answer("folder no longer there — refreshing")
+                await self._refresh_browse(query, state)
+                return True
+            child_name, _ = dirs[idx]
+            new_path = str(Path(state["path"]) / child_name)
+            state["path"] = new_path
+            state["name"] = child_name  # default chat name = folder name
+            await self._refresh_browse(query, state)
+            return True
+
+        if verb == "up":
+            parent = str(Path(state["path"]).parent)
+            if parent == state["path"]:
+                await query.answer("already at /")
+                return True
+            state["path"] = parent
+            state["name"] = Path(parent).name or state["mac"]
+            await self._refresh_browse(query, state)
+            return True
+
+        if verb == "hidden":
+            state["show_hidden"] = not state.get("show_hidden", False)
+            await self._refresh_browse(query, state)
+            return True
+
+        if verb == "newdir":
+            await self._prompt_new_folder_in_state(query, state)
+            return True
+
+        if verb == "setname":
+            await self._prompt_set_name(query, state)
+            return True
+
+        if verb == "open":
+            await self._confirm_open_browse(query, state)
             return True
 
         await query.answer("unknown")
         return True
 
-    async def _show_browse_listing(
+    async def _begin_browse(
         self, query: CallbackQuery, mac_name: str, *, show_hidden: bool
     ) -> None:
         try:
@@ -1128,62 +1179,123 @@ class BridgeBot:
             )
             await query.answer()
             return
+        # Remember the resolved main_dir so 'up' knows when not to go further
+        # (we let it go above main_dir but limit at the filesystem root)
+        state = {
+            "mac": mac_name,
+            "path": resolved_path,
+            "main_dir": resolved_path,
+            "name": Path(resolved_path).name or mac_name,
+            "show_hidden": show_hidden,
+            "items": items,
+        }
+        if query.message is not None:
+            self._browse_state[query.message.message_id] = state
         await menu_ui._safe_edit(
             self.bot, query,
-            text=menu_ui.folder_picker_text(
-                mac_name, resolved_path, items, show_hidden=show_hidden
+            text=menu_ui.navigate_text(
+                mac_name=mac_name, path=resolved_path,
+                name=state["name"], folder_items=items,
+                show_hidden=show_hidden,
             ),
-            keyboard=menu_ui.folder_picker_keyboard(
-                mac_name, resolved_path, items, show_hidden=show_hidden
+            keyboard=menu_ui.navigate_keyboard(
+                folder_items=items, show_hidden=show_hidden,
+                can_go_up=str(Path(resolved_path).parent) != resolved_path,
             ),
         )
         await query.answer()
 
-    async def _open_session_in_folder(
-        self,
-        query: CallbackQuery,
-        mac_name: str,
-        folder: str,
-        *,
-        source: str,
+    async def _refresh_browse(
+        self, query: CallbackQuery, state: dict[str, Any]
     ) -> None:
-        await query.answer(f"opening {folder}…")
-        mac_row = await self.db.get_mac(mac_name)
-        main_dir = (mac_row.main_dir if mac_row else None) or "~"
-        full_path = str(Path(main_dir).expanduser() / folder)
-        # Apply layered defaults — we still go through _resolve_for_new so the
-        # user's chosen model/effort/mode get layered correctly.
-        args = ParsedArgs(
-            name=folder, cwd=full_path, mac=mac_name,
-            model=None, effort=None, mode=None,
-        )
-        resolved = await self._resolve_for_new(args)
-        await self._execute_new_session(resolved, source_label=f"via {source} on {mac_name}")
-        # Edit the browse message away — the new topic has its own ready card
+        try:
+            conn = self.runners.get(state["mac"])
+            resolved_path, items = await conn.list_dir(
+                state["path"], show_hidden=state.get("show_hidden", False)
+            )
+        except Exception as exc:
+            await menu_ui._safe_edit(
+                self.bot, query,
+                text=f"⚠ couldn't list {state['mac']}:{state['path']}\n\n{exc!s}",
+                keyboard=None,
+            )
+            await query.answer()
+            return
+        state["path"] = resolved_path
+        state["items"] = items
         await menu_ui._safe_edit(
             self.bot, query,
-            text=f"✓ opened {mac_name}:{full_path}",
-            keyboard=None,
+            text=menu_ui.navigate_text(
+                mac_name=state["mac"], path=resolved_path,
+                name=state["name"], folder_items=items,
+                show_hidden=state.get("show_hidden", False),
+            ),
+            keyboard=menu_ui.navigate_keyboard(
+                folder_items=items,
+                show_hidden=state.get("show_hidden", False),
+                can_go_up=str(Path(resolved_path).parent) != resolved_path,
+            ),
         )
+        await query.answer()
 
-    async def _prompt_new_folder(self, query: CallbackQuery, mac_name: str) -> None:
-        mac_row = await self.db.get_mac(mac_name)
-        main_dir = (mac_row.main_dir if mac_row else None) or "~"
-        # Send a ForceReply prompt and remember it
+    async def _prompt_new_folder_in_state(
+        self, query: CallbackQuery, state: dict[str, Any]
+    ) -> None:
+        if query.message is None:
+            return
         sent = await self.bot.send_message(
             chat_id=self.settings.telegram_chat_id,
             text=(
-                f"➕ new folder under {mac_name}:{main_dir}\n"
+                f"➕ new folder under {state['mac']}:{state['path']}\n"
                 f"reply with the folder name (no slashes)"
             ),
             reply_markup=ForceReply(selective=True),
         )
         self._pending_replies[sent.message_id] = {
             "action": "new_folder",
-            "mac": mac_name,
-            "main_dir": main_dir,
+            "browse_message_id": query.message.message_id,
         }
         await query.answer("type a name…")
+
+    async def _prompt_set_name(
+        self, query: CallbackQuery, state: dict[str, Any]
+    ) -> None:
+        if query.message is None:
+            return
+        sent = await self.bot.send_message(
+            chat_id=self.settings.telegram_chat_id,
+            text=(
+                f"✏ session name (currently: {state['name']})\n"
+                f"reply with a custom name, or '-' to use the folder name"
+            ),
+            reply_markup=ForceReply(selective=True),
+        )
+        self._pending_replies[sent.message_id] = {
+            "action": "set_name",
+            "browse_message_id": query.message.message_id,
+        }
+        await query.answer("type a name…")
+
+    async def _confirm_open_browse(
+        self, query: CallbackQuery, state: dict[str, Any]
+    ) -> None:
+        await query.answer(f"opening {state['name']}…")
+        # Drop browse state — we're done navigating
+        if query.message is not None:
+            self._browse_state.pop(query.message.message_id, None)
+        args = ParsedArgs(
+            name=state["name"], cwd=state["path"], mac=state["mac"],
+            model=None, effort=None, mode=None,
+        )
+        resolved = await self._resolve_for_new(args)
+        await self._execute_new_session(
+            resolved, source_label=f"via browse on {state['mac']}"
+        )
+        await menu_ui._safe_edit(
+            self.bot, query,
+            text=f"✓ opened {state['mac']}:{state['path']} as {state['name']!r}",
+            keyboard=None,
+        )
 
     async def _edit_to_new_menu(self, query: CallbackQuery) -> None:
         """Re-render the /new menu inside an existing message (used by 'back')."""
@@ -1228,36 +1340,96 @@ class BridgeBot:
         action = pending.get("action")
         if action == "new_folder":
             await self._handle_new_folder_reply(message, pending)
+        elif action == "set_name":
+            await self._handle_set_name_reply(message, pending)
 
     async def _handle_new_folder_reply(
         self, message: Message, pending: dict[str, Any]
     ) -> None:
-        mac_name = pending["mac"]
-        main_dir = pending["main_dir"]
+        browse_msg_id = pending.get("browse_message_id")
+        state = self._browse_state.get(browse_msg_id) if browse_msg_id else None
+        if state is None:
+            await message.answer("⚠ browse session expired — tap [📂 browse] again")
+            return
         folder_name = (message.text or "").strip()
         if not folder_name or "/" in folder_name or folder_name in (".", ".."):
             await message.answer("⚠ folder name can't be empty, contain '/', or be '.' / '..'")
             return
         try:
-            conn = self.runners.get(mac_name)
+            conn = self.runners.get(state["mac"])
         except KeyError:
-            await message.answer(f"⚠ runner {mac_name!r} no longer registered")
+            await message.answer(f"⚠ runner {state['mac']!r} no longer registered")
             return
-        full_path = str(Path(main_dir).expanduser() / folder_name)
+        full_path = str(Path(state["path"]) / folder_name)
         try:
             await conn.mkdir(full_path)
         except RuntimeError as exc:
             await message.answer(f"⚠ couldn't create {folder_name}: {exc!s}")
             return
-        # Now open a session there
-        args = ParsedArgs(
-            name=folder_name, cwd=full_path, mac=mac_name,
-            model=None, effort=None, mode=None,
-        )
-        resolved = await self._resolve_for_new(args)
-        await self._execute_new_session(
-            resolved, source_label=f"via browse on {mac_name} (new folder)"
-        )
+        # Drill into the new folder so the user sees they're inside it
+        state["path"] = full_path
+        state["name"] = folder_name
+        # Re-render the browse card. Build a fake CallbackQuery-like wrapper
+        # so we can reuse _refresh_browse, OR just edit directly here.
+        try:
+            resolved_path, items = await conn.list_dir(
+                full_path, show_hidden=state.get("show_hidden", False)
+            )
+        except Exception as exc:
+            await message.answer(f"⚠ created {folder_name} but couldn't list it: {exc!s}")
+            return
+        state["items"] = items
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.settings.telegram_chat_id,
+                message_id=browse_msg_id,
+                text=menu_ui.navigate_text(
+                    mac_name=state["mac"], path=resolved_path,
+                    name=state["name"], folder_items=items,
+                    show_hidden=state.get("show_hidden", False),
+                ),
+                reply_markup=menu_ui.navigate_keyboard(
+                    folder_items=items,
+                    show_hidden=state.get("show_hidden", False),
+                    can_go_up=str(Path(resolved_path).parent) != resolved_path,
+                ),
+            )
+        except TelegramBadRequest:
+            pass
+        await message.answer(f"✓ created {full_path} — drilling in")
+
+    async def _handle_set_name_reply(
+        self, message: Message, pending: dict[str, Any]
+    ) -> None:
+        browse_msg_id = pending.get("browse_message_id")
+        state = self._browse_state.get(browse_msg_id) if browse_msg_id else None
+        if state is None:
+            await message.answer("⚠ browse session expired — tap [📂 browse] again")
+            return
+        raw = (message.text or "").strip()
+        if raw == "-" or not raw:
+            new_name = Path(state["path"]).name or state["mac"]
+        else:
+            new_name = raw[:64]  # bounded for forum-topic name
+        state["name"] = new_name
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.settings.telegram_chat_id,
+                message_id=browse_msg_id,
+                text=menu_ui.navigate_text(
+                    mac_name=state["mac"], path=state["path"],
+                    name=new_name, folder_items=state["items"],
+                    show_hidden=state.get("show_hidden", False),
+                ),
+                reply_markup=menu_ui.navigate_keyboard(
+                    folder_items=state["items"],
+                    show_hidden=state.get("show_hidden", False),
+                    can_go_up=str(Path(state["path"]).parent) != state["path"],
+                ),
+            )
+        except TelegramBadRequest:
+            pass
+        await message.answer(f"✓ name → {new_name}")
 
     async def _close_session_via_menu(self, session: TopicSession) -> None:
         """Called by the action card's close button."""

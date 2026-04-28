@@ -540,57 +540,87 @@ def mac_picker_keyboard(mac_names: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def folder_picker_keyboard(
-    mac_name: str,
-    main_dir: str,
-    items: list[tuple[str, bool]],
+_FOLDER_NAME_DISPLAY_LIMIT = 32  # truncate long names in button labels
+
+
+def _trunc_button(name: str) -> str:
+    if len(name) <= _FOLDER_NAME_DISPLAY_LIMIT:
+        return name
+    return name[: _FOLDER_NAME_DISPLAY_LIMIT - 1] + "…"
+
+
+def navigate_keyboard(
     *,
+    folder_items: list[tuple[str, bool]],
     show_hidden: bool,
+    can_go_up: bool,
 ) -> InlineKeyboardMarkup:
-    """Build a folder-picker keyboard. Only directory items are tappable as
-    "open here" — files are listed but not actionable."""
+    """Folder-navigation keyboard. Each folder button drills INTO that folder
+    rather than opening a session in it. The bottom rows let the user create,
+    rename, go up, toggle hidden, confirm-open, or cancel.
+
+    Folder positions are encoded as `cd:<index>` so callback_data stays bounded
+    regardless of folder name length. The bridge maintains a per-message cache
+    of `folder_items` to look up the index → name mapping.
+    """
     rows: list[list[InlineKeyboardButton]] = []
-    # Cap at ~30 dirs, paginate later if needed
-    folder_items = [(n, is_dir) for n, is_dir in items if is_dir][:30]
-    for i in range(0, len(folder_items), 2):
+    dirs = [(n, is_dir) for n, is_dir in folder_items if is_dir][:24]
+    for i in range(0, len(dirs), 2):
         row = []
-        for n, _ in folder_items[i : i + 2]:
-            row.append(
-                InlineKeyboardButton(
-                    text=f"📁 {n}",
-                    callback_data=BROWSE_PREFIX + f"o:{mac_name}:{n}",
-                )
-            )
+        for j, (name, _) in enumerate(dirs[i : i + 2]):
+            row.append(InlineKeyboardButton(
+                text=f"📁 {_trunc_button(name)}",
+                callback_data=BROWSE_PREFIX + f"cd:{i + j}",
+            ))
         rows.append(row)
-    # Extras
+    if not dirs:
+        rows.append([InlineKeyboardButton(
+            text="(no folders here)", callback_data=BROWSE_PREFIX + "noop",
+        )])
+
     rows.append([
-        InlineKeyboardButton(
-            text="➕ new folder",
-            callback_data=BROWSE_PREFIX + f"n:{mac_name}",
-        ),
-        InlineKeyboardButton(
-            text=("👁‍🗨 hide hidden" if show_hidden else "👁 show hidden"),
-            callback_data=BROWSE_PREFIX + f"m:{mac_name}:{'noh' if show_hidden else 'h'}",
-        ),
+        InlineKeyboardButton(text="➕ new folder", callback_data=BROWSE_PREFIX + "newdir"),
+        InlineKeyboardButton(text="✏ rename", callback_data=BROWSE_PREFIX + "setname"),
+    ])
+    bottom_row: list[InlineKeyboardButton] = []
+    if can_go_up:
+        bottom_row.append(InlineKeyboardButton(text="⬆ up", callback_data=BROWSE_PREFIX + "up"))
+    bottom_row.append(InlineKeyboardButton(
+        text=("👁‍🗨 hide hidden" if show_hidden else "👁 show hidden"),
+        callback_data=BROWSE_PREFIX + "hidden",
+    ))
+    rows.append(bottom_row)
+    rows.append([
+        InlineKeyboardButton(text="✓ open session here", callback_data=BROWSE_PREFIX + "open"),
     ])
     rows.append([
-        InlineKeyboardButton(text="← back", callback_data=BROWSE_PREFIX + "back"),
+        InlineKeyboardButton(text="✗ cancel", callback_data=BROWSE_PREFIX + "back"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def folder_picker_text(
-    mac_name: str, main_dir: str, items: list[tuple[str, bool]], *, show_hidden: bool
+def navigate_text(
+    *,
+    mac_name: str,
+    path: str,
+    name: str,
+    folder_items: list[tuple[str, bool]],
+    show_hidden: bool,
 ) -> str:
-    n_dirs = sum(1 for _, is_dir in items if is_dir)
-    n_files = sum(1 for _, is_dir in items if not is_dir)
-    file_summary = ""
+    n_dirs = sum(1 for _, is_dir in folder_items if is_dir)
+    n_files = sum(1 for _, is_dir in folder_items if not is_dir)
+    files_note = ""
     if n_files > 0:
-        file_names = [n for n, is_dir in items if not is_dir][:8]
-        file_summary = f"\n(also {n_files} non-folder entries: {', '.join(file_names[:5])}{'…' if len(file_names) > 5 else ''})"
-    suffix = "  ·  hidden visible" if show_hidden else ""
+        files = [n for n, is_dir in folder_items if not is_dir][:5]
+        files_note = (
+            f"\n  (plus {n_files} non-folders: {', '.join(files)}"
+            f"{'…' if n_files > len(files) else ''})"
+        )
+    hidden_note = "  ·  hidden visible" if show_hidden else ""
     return (
-        f"📂 {mac_name}:{main_dir}{suffix}\n"
-        f"{n_dirs} folder(s)\n{file_summary}\n"
-        f"\ntap a folder to open a session there, or ➕ to create a new one."
+        f"📂 {mac_name}:{path}{hidden_note}\n"
+        f"session name: {name}\n"
+        f"\n{n_dirs} folder(s) here.{files_note}\n"
+        f"\ntap a folder to drill in. when you're at the right place,"
+        f"\ntap ✓ open session here."
     )
