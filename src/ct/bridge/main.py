@@ -59,6 +59,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="macs",        description="List or manage registered runners"),
     BotCommand(command="status",      description="Bot uptime + runners + sessions"),
     BotCommand(command="context",     description="Show context-window usage for this session"),
+    BotCommand(command="rewind",      description="Rewind file changes since the last user message"),
     BotCommand(command="help",        description="Show usage"),
 ]
 

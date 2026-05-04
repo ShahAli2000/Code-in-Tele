@@ -73,6 +73,8 @@ from ct.protocol.envelopes import (
     T_PERMISSION_REQUEST,
     T_PING,
     T_PRECOMPACT,
+    T_REWIND,
+    T_REWIND_OK,
     T_SDK_ID,
     T_SEND,
     T_SET_MODE,
@@ -229,6 +231,23 @@ class SessionHandle:
 
     async def interrupt(self) -> None:
         await self._conn._send(Envelope(T_INTERRUPT, self.sid, {}))
+
+    async def rewind_files(self, user_message_uuid: str | None = None) -> str:
+        """Restore tracked file state to the given user-message uuid (or the
+        runner's most recent cached uuid if None). Returns the uuid that was
+        rewound to. Raises if no checkpoint is available or the runner errors."""
+        env = await self._conn._call_rpc(
+            T_REWIND,
+            {"sid": self.sid, "user_message_uuid": user_message_uuid},
+            timeout=15.0,
+        )
+        if env.type == T_ERROR:
+            raise RuntimeError(
+                f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
+            )
+        if env.type != T_REWIND_OK:
+            raise RuntimeError(f"unexpected reply type: {env.type}")
+        return str(env.payload.get("user_message_uuid", ""))
 
     async def get_context_usage(self) -> dict[str, Any]:
         """Snapshot of SDK context-window usage. Returns the dict shape from

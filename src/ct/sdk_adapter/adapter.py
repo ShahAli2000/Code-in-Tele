@@ -43,6 +43,7 @@ from claude_agent_sdk import (
     PermissionResultDeny,
     SystemMessage,
     ToolPermissionContext,
+    UserMessage,
 )
 
 from ct.sdk_adapter.tools import build_mcp_server
@@ -201,6 +202,11 @@ class SessionRunner:
         # bridge signal "approve this tool, and skip the prompt for any further
         # use of the same tool within this session".
         self._pending: dict[str, asyncio.Future[tuple[str, Any, bool]]] = {}
+        # Most-recent UserMessage.uuid we saw in the SDK stream. Updated in
+        # `turn(...)` whenever a UserMessage flows through. The bridge's
+        # /rewind passes this back to rewind_files() to restore tracked file
+        # state to the moment that user message was received.
+        self.last_user_message_uuid: str | None = None
         # Tool names the user has chosen to always-allow for this session.
         # Seeded from `auto_allow_tools` (bot/profile pre-trust list) and
         # extended at runtime via approve-and-remember. Cleared on stop —
@@ -286,6 +292,18 @@ class SessionRunner:
             options_kwargs["max_budget_usd"] = self.max_budget_usd
         if self.fallback_model:
             options_kwargs["fallback_model"] = self.fallback_model
+        # File checkpointing: enables ClaudeSDKClient.rewind_files() so the
+        # bridge's /rewind can restore on-disk file state to the moment a
+        # specific user message was received. Requires the
+        # `replay-user-messages` CLI flag so each UserMessage carries its
+        # `uuid` in the response stream — the runner caches the most recent
+        # uuid for the bridge to rewind to.
+        options_kwargs["enable_file_checkpointing"] = True
+        existing_extra = options_kwargs.get("extra_args") or {}
+        options_kwargs["extra_args"] = {
+            **dict(existing_extra),
+            "replay-user-messages": None,
+        }
         # Pipe the SDK CLI subprocess's stderr to our logger — without this,
         # CLI-level errors (auth failures, malformed envelopes from the CLI
         # side, deprecation warnings) go to whatever stderr the runner has,
@@ -339,6 +357,13 @@ class SessionRunner:
                             log.exception(
                                 "session.id_callback_failed", session_id=sid
                             )
+            # Track the most recent UserMessage uuid so /rewind has a target.
+            # Only set when extra_args includes replay-user-messages (which we
+            # do at start()). UserMessage may also be a tool_result echo —
+            # those have parent_tool_use_id set, skip them.
+            if isinstance(msg, UserMessage) and getattr(msg, "uuid", None):
+                if msg.parent_tool_use_id is None:
+                    self.last_user_message_uuid = msg.uuid
             yield msg
 
     # ---- runtime control ----------------------------------------------------
@@ -359,6 +384,25 @@ class SessionRunner:
         await self._client.set_permission_mode(mode)
         self.permission_mode = mode
         log.info("session.permission_mode_changed", session_id=self.session_id, mode=mode)
+
+    async def rewind_files(self, user_message_uuid: str | None = None) -> str | None:
+        """Restore tracked files to their state at a specific user message.
+        If user_message_uuid is None, uses self.last_user_message_uuid (the
+        most recent user message we observed). Returns the uuid that was
+        rewound to, or None if no checkpoint is available.
+
+        Requires enable_file_checkpointing=True at session start (set in
+        start()) so the SDK has been tracking edits."""
+        if self._client is None:
+            raise RuntimeError("SessionRunner not started")
+        target = user_message_uuid or self.last_user_message_uuid
+        if target is None:
+            return None
+        await self._client.rewind_files(target)
+        log.info(
+            "session.files_rewound", session_id=self.session_id, uuid=target
+        )
+        return target
 
     async def get_context_usage(self) -> dict[str, Any] | None:
         """Snapshot of the SDK's view of context window usage. Returns None

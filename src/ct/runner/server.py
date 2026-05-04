@@ -92,6 +92,8 @@ from ct.protocol.envelopes import (
     T_PERMISSION_REQUEST,
     T_PING,
     T_PRECOMPACT,
+    T_REWIND,
+    T_REWIND_OK,
     T_PONG,
     T_SDK_ID,
     T_SEND,
@@ -644,6 +646,8 @@ class RunnerConnection:
                 await self._handle_search(env)
             elif env.type == T_GET_CONTEXT:
                 await self._handle_get_context(env)
+            elif env.type == T_REWIND:
+                await self._handle_rewind(env)
             else:
                 await self._send_error(env.id, "unsupported_type", env.type)
         except Exception as exc:
@@ -971,6 +975,35 @@ class RunnerConnection:
                 file_payload(path=str(path), content_b64=b64, size=len(data)),
             )
         )
+
+    async def _handle_rewind(self, env: Envelope) -> None:
+        """Restore on-disk file state to a user-message uuid via SDK
+        rewind_files. Uses env.id as request_id; sid + optional uuid in
+        payload (uuid=None means "use the runner's last cached uuid")."""
+        sid = env.payload.get("sid")
+        uuid = env.payload.get("user_message_uuid")
+        if not isinstance(sid, str):
+            await self._send_error(env.id, "bad_request", "rewind.sid required")
+            return
+        session = self.sessions.get(sid)
+        if session is None or session.runner is None:
+            await self._send_error(env.id, "no_session", "open the session first")
+            return
+        try:
+            target = await session.runner.rewind_files(
+                user_message_uuid=uuid if isinstance(uuid, str) else None
+            )
+        except Exception as exc:
+            log.exception("runner.rewind_failed", sid=sid)
+            await self._send_error(env.id, "rewind_failed", repr(exc))
+            return
+        if target is None:
+            await self._send_error(
+                env.id, "no_checkpoint",
+                "no user-message checkpoint to rewind to (need at least one prior turn)",
+            )
+            return
+        await self._send(Envelope(T_REWIND_OK, env.id, {"user_message_uuid": target}))
 
     async def _handle_get_context(self, env: Envelope) -> None:
         """Snapshot the SDK's view of context-window usage. Single shot —

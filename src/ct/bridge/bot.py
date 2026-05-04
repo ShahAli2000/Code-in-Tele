@@ -277,6 +277,7 @@ class BridgeBot:
         self._router.message.register(self.cmd_search, Command("search"))
         self._router.message.register(self.cmd_stats, Command("stats"))
         self._router.message.register(self.cmd_context, Command("context"))
+        self._router.message.register(self.cmd_rewind, Command("rewind"))
         self._router.message.register(self.cmd_allow, Command("allow"))
         self._router.message.register(self.cmd_tunnel, Command("tunnel"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
@@ -1527,6 +1528,39 @@ class BridgeBot:
                 tk = int(cat.get("tokens", 0))
                 lines.append(f"    • {name}: {tk:,}")
         await message.answer("\n".join(lines))
+
+    async def cmd_rewind(self, message: Message) -> None:
+        """/rewind — restore tracked file state to the most recent user
+        message in this session. Different from /undo (which reverses
+        action-level destructive ops like close/delete-profile). /rewind
+        operates on actual on-disk file changes from the session's Edit /
+        Write tools, and survives bridge restarts (state lives in the SDK's
+        on-disk checkpoint store)."""
+        if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
+            await message.answer("/rewind only works inside a session topic.")
+            return
+        session = self.sessions.get(message.message_thread_id)
+        if session is None:
+            await message.answer("no session in this topic — /new to start one.")
+            return
+        async with session.turn_lock:
+            try:
+                target = await session.runner.rewind_files()
+            except Exception as exc:
+                msg = str(exc)
+                if "no_checkpoint" in msg:
+                    await message.answer(
+                        "↶ nothing to rewind — no prior turn checkpoint yet "
+                        "(send a message first, then /rewind reverses Claude's "
+                        "file changes since)."
+                    )
+                else:
+                    await message.answer(f"⚠ rewind failed: {exc}")
+                return
+        await message.answer(
+            f"↶ files rewound to state at user message `{target[:8]}…` — "
+            "send a new message to continue."
+        )
 
     async def cmd_search(self, message: Message) -> None:
         """Fan-out substring search across all runners' transcripts. Anywhere
