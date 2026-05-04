@@ -130,6 +130,17 @@ class PermissionRequest:
 PermissionRequestHandler = Callable[[PermissionRequest], Awaitable[None]]
 
 
+# Per-session backstops on runaway tool loops or accidental cost spikes.
+# Both are belt-and-braces against `bypassPermissions` profiles — even if a
+# permission gate is off, a session can't grind forever or rack up unexpected
+# spend. Override via env if you want different defaults for your fleet.
+import os as _os
+_DEFAULT_MAX_TURNS = int(_os.environ.get("CT_MAX_TURNS_PER_SESSION", "40"))
+_DEFAULT_MAX_BUDGET_USD = float(_os.environ.get("CT_MAX_BUDGET_USD", "5.0"))
+# Auto-fallback if the primary model is rate-limited. Empty string disables.
+_DEFAULT_FALLBACK_MODEL = _os.environ.get("CT_FALLBACK_MODEL", "claude-sonnet-4-6")
+
+
 class SessionRunner:
     def __init__(
         self,
@@ -144,6 +155,9 @@ class SessionRunner:
         effort: str | None = None,
         thinking: bool = True,
         auto_allow_tools: set[str] | None = None,
+        max_turns: int | None = None,
+        max_budget_usd: float | None = None,
+        fallback_model: str | None = None,
     ) -> None:
         self.cwd = cwd
         self.permission_mode: PermissionMode = permission_mode
@@ -157,6 +171,19 @@ class SessionRunner:
         # The bridge defaults `True`; toggle off via `/think off`. Plumbed into
         # ClaudeAgentOptions.thinking at SDK connect time.
         self.thinking = thinking
+        # Backstops — None means "use the env default". Setting an explicit
+        # 0 / 0.0 disables that backstop for this session. The SDK enforces
+        # both: max_turns trips a clean stop_reason, max_budget_usd halts on
+        # cumulative API spend.
+        self.max_turns = max_turns if max_turns is not None else _DEFAULT_MAX_TURNS
+        self.max_budget_usd = (
+            max_budget_usd if max_budget_usd is not None else _DEFAULT_MAX_BUDGET_USD
+        )
+        self.fallback_model = (
+            fallback_model
+            if fallback_model is not None
+            else (_DEFAULT_FALLBACK_MODEL or None)
+        )
         # Tools the user has pre-trusted bot-wide (or per-profile, when that
         # plumbing arrives). Same in-memory set as approve-and-remember
         # populates at runtime — same trust ledger, different seed source.
@@ -241,6 +268,21 @@ class SessionRunner:
         options_kwargs["thinking"] = (
             {"type": "adaptive"} if self.thinking else {"type": "disabled"}
         )
+        # Backstops: stop after N tool-using turns, or $X cumulative API spend
+        # within this session. The SDK terminates with a clean ResultMessage,
+        # which the runner already translates into T_TURN_END.
+        if self.max_turns and self.max_turns > 0:
+            options_kwargs["max_turns"] = self.max_turns
+        if self.max_budget_usd and self.max_budget_usd > 0:
+            options_kwargs["max_budget_usd"] = self.max_budget_usd
+        if self.fallback_model:
+            options_kwargs["fallback_model"] = self.fallback_model
+        # Pipe the SDK CLI subprocess's stderr to our logger — without this,
+        # CLI-level errors (auth failures, malformed envelopes from the CLI
+        # side, deprecation warnings) go to whatever stderr the runner has,
+        # which is structlog's stderr stream → the launchd log file. Routing
+        # through structlog lets ops filter by tag.
+        options_kwargs["stderr"] = self._on_sdk_stderr
         options = ClaudeAgentOptions(**options_kwargs)
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()
@@ -414,3 +456,10 @@ class SessionRunner:
     ) -> dict[str, Any]:
         """Required no-op PreToolUse hook so can_use_tool fires in Python."""
         return {"continue_": True}
+
+    def _on_sdk_stderr(self, line: str) -> None:
+        """Callback for stderr lines from the SDK CLI subprocess. Logged at
+        warn-level with the session id so a noisy CLI is greppable."""
+        line = line.rstrip()
+        if line:
+            log.warning("sdk_cli_stderr", session_id=self.session_id, line=line)
