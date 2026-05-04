@@ -274,6 +274,7 @@ class BridgeBot:
         self._router.message.register(self.cmd_quiet, Command("quiet"))
         self._router.message.register(self.cmd_search, Command("search"))
         self._router.message.register(self.cmd_stats, Command("stats"))
+        self._router.message.register(self.cmd_context, Command("context"))
         self._router.message.register(self.cmd_allow, Command("allow"))
         self._router.message.register(self.cmd_tunnel, Command("tunnel"))
         self._router.message.register(self.cmd_help, Command("help", "start"))
@@ -1480,6 +1481,49 @@ class BridgeBot:
                     + (f"  effort={s.effort}" if s.effort else "")
                 )
 
+        await message.answer("\n".join(lines))
+
+    # /context warns at this fill ratio (0–1.0). Below this is fine.
+    CONTEXT_WARN_RATIO = 0.80
+
+    async def cmd_context(self, message: Message) -> None:
+        """/context — show how full the SDK's context window is for this
+        topic's session. Uses ClaudeSDKClient.get_context_usage() under the
+        hood. Per-session — must be invoked inside a session topic."""
+        if message.message_thread_id is None or message.message_thread_id == GENERAL_TOPIC_ID:
+            await message.answer("/context only works inside a session topic.")
+            return
+        session = self.sessions.get(message.message_thread_id)
+        if session is None:
+            await message.answer("no session in this topic — /new to start one.")
+            return
+        try:
+            usage = await session.runner.get_context_usage()
+        except Exception as exc:
+            await message.answer(f"⚠ context query failed: {exc}")
+            return
+        total = int(usage.get("totalTokens", 0))
+        eff_max = int(usage.get("maxTokens", 0))
+        raw_max = int(usage.get("rawMaxTokens", eff_max or 0))
+        pct = float(usage.get("percentage", 0.0))
+        model = str(usage.get("model", "?"))
+        warn = "  ⚠️  approaching limit — expect autocompact soon" if pct >= self.CONTEXT_WARN_RATIO * 100 else ""
+        lines = [
+            f"📊 context for {session.project_name!r}",
+            f"  model:    {model}",
+            f"  tokens:   {total:,} / {eff_max:,} ({pct:.1f}%){warn}",
+        ]
+        if raw_max and raw_max != eff_max:
+            lines.append(f"  raw_max:  {raw_max:,}  (effective max reduced by autocompact buffer)")
+        cats = usage.get("categories") or []
+        if cats:
+            lines.append("  by category:")
+            for cat in cats:
+                if not isinstance(cat, dict):
+                    continue
+                name = cat.get("name", "?")
+                tk = int(cat.get("tokens", 0))
+                lines.append(f"    • {name}: {tk:,}")
         await message.answer("\n".join(lines))
 
     async def cmd_search(self, message: Message) -> None:

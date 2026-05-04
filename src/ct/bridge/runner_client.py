@@ -48,6 +48,7 @@ from ct.protocol.envelopes import (
     T_CLOSE,
     T_CLOSED,
     T_DECIDE,
+    T_CONTEXT,
     T_DIR_LISTING,
     T_ERROR,
     T_EXPORT,
@@ -55,6 +56,7 @@ from ct.protocol.envelopes import (
     T_FILE,
     T_FORK,
     T_FORK_OK,
+    T_GET_CONTEXT,
     T_GET_FILE,
     T_GET_LOGS,
     T_INTERRUPT,
@@ -226,6 +228,21 @@ class SessionHandle:
 
     async def interrupt(self) -> None:
         await self._conn._send(Envelope(T_INTERRUPT, self.sid, {}))
+
+    async def get_context_usage(self) -> dict[str, Any]:
+        """Snapshot of SDK context-window usage. Returns the dict shape from
+        the SDK's ContextUsageResponse (totalTokens, maxTokens, percentage,
+        model, categories). Raises on runner error or if no session is open."""
+        env = await self._conn._call_rpc(
+            T_GET_CONTEXT, {"sid": self.sid}, timeout=10.0
+        )
+        if env.type == T_ERROR:
+            raise RuntimeError(
+                f"{env.payload.get('kind','?')}: {env.payload.get('message','?')}"
+            )
+        if env.type != T_CONTEXT:
+            raise RuntimeError(f"unexpected reply type: {env.type}")
+        return dict(env.payload)
 
     async def close(self) -> None:
         if self._state.closed.is_set():

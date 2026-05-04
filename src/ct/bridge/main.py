@@ -58,6 +58,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="defaults",    description="Show or set bot-wide defaults"),
     BotCommand(command="macs",        description="List or manage registered runners"),
     BotCommand(command="status",      description="Bot uptime + runners + sessions"),
+    BotCommand(command="context",     description="Show context-window usage for this session"),
     BotCommand(command="help",        description="Show usage"),
 ]
 

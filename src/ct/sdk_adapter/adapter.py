@@ -351,6 +351,15 @@ class SessionRunner:
         self.permission_mode = mode
         log.info("session.permission_mode_changed", session_id=self.session_id, mode=mode)
 
+    async def get_context_usage(self) -> dict[str, Any] | None:
+        """Snapshot of the SDK's view of context window usage. Returns None
+        if the client isn't connected (caller surfaces). The SDK returns a
+        TypedDict but we widen to plain dict for transport over the WS."""
+        if self._client is None:
+            return None
+        usage = await self._client.get_context_usage()
+        return dict(usage) if usage is not None else None
+
     async def set_model(self, model: str) -> None:
         """Switch the model on the running ClaudeSDKClient. Takes effect on
         the next turn (the SDK applies it on the next assistant message)."""

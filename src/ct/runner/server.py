@@ -66,6 +66,7 @@ from ct.protocol.envelopes import (
     ProtocolError,
     T_CLOSE,
     T_CLOSED,
+    T_CONTEXT,
     T_DECIDE,
     T_DIR_LISTING,
     T_ERROR,
@@ -74,6 +75,7 @@ from ct.protocol.envelopes import (
     T_FILE,
     T_FORK,
     T_FORK_OK,
+    T_GET_CONTEXT,
     T_GET_FILE,
     T_GET_LOGS,
     T_INTERRUPT,
@@ -639,6 +641,8 @@ class RunnerConnection:
                 await self._handle_get_file(env)
             elif env.type == T_SEARCH:
                 await self._handle_search(env)
+            elif env.type == T_GET_CONTEXT:
+                await self._handle_get_context(env)
             else:
                 await self._send_error(env.id, "unsupported_type", env.type)
         except Exception as exc:
@@ -962,6 +966,26 @@ class RunnerConnection:
                 file_payload(path=str(path), content_b64=b64, size=len(data)),
             )
         )
+
+    async def _handle_get_context(self, env: Envelope) -> None:
+        """Snapshot the SDK's view of context-window usage. Single shot —
+        if the bridge wants polling it polls. Uses env.id as a request_id
+        (mirrors get_logs / fork — payload.sid carries the session)."""
+        sid = env.payload.get("sid")
+        if not isinstance(sid, str):
+            await self._send_error(env.id, "bad_request", "get_context.sid required")
+            return
+        session = self.sessions.get(sid)
+        if session is None or session.runner is None:
+            await self._send_error(env.id, "no_session", "open the session first")
+            return
+        try:
+            usage = await session.runner.get_context_usage()
+        except Exception as exc:
+            log.exception("runner.get_context_failed", sid=sid)
+            await self._send_error(env.id, "get_context_failed", repr(exc))
+            return
+        await self._send(Envelope(T_CONTEXT, env.id, usage or {}))
 
     async def _handle_search(self, env: Envelope) -> None:
         """Walk ~/.claude/projects/*/*.jsonl for case-insensitive substring
