@@ -140,6 +140,10 @@ async def _run() -> int:
         token=settings.telegram_bot_token,
         default=DefaultBotProperties(parse_mode=None),
     )
+    # Install the retry-after middleware before any messages are sent so even
+    # restoration / startup notifications survive a Telegram 429.
+    from ct.bridge._telegram_retry import install as _install_retry_middleware
+    _install_retry_middleware(bot)
     db = Db(settings.db_path)
     await db.open()
 
