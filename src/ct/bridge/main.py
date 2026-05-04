@@ -267,6 +267,10 @@ async def _run() -> int:
     # HEALTH_CHECK_INTERVAL_S so /macs can render 🟢/🟡/🔴 instead of relying
     # on `last_connected` (which goes stale the moment a mac sleeps).
     health_task = bridge.start_health_check()
+    # Daily prune of state='closed' sessions older than CT_PRUNE_RETENTION_DAYS
+    # (default 90). Without this the DB grows forever — sessions are never
+    # auto-deleted, only marked closed.
+    prune_task = bridge.start_prune_daemon()
 
     await stop_event.wait()
     log.info("bridge.shutting_down")
@@ -277,12 +281,17 @@ async def _run() -> int:
     polling_task.cancel()
     idle_task.cancel()
     health_task.cancel()
+    prune_task.cancel()
     try:
         await polling_task
     except (asyncio.CancelledError, Exception):
         pass
     try:
         await idle_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    try:
+        await prune_task
     except (asyncio.CancelledError, Exception):
         pass
     try:

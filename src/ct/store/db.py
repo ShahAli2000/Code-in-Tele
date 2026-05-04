@@ -253,6 +253,65 @@ class Db:
         await self.conn.commit()
         log.warning("db.session_orphaned", thread_id=thread_id, reason=reason)
 
+    async def prune_old_closed(self, *, days: int = 90) -> dict[str, int]:
+        """Remove sessions in state='closed' older than `days`, plus any
+        message_log + pending_permissions rows tied to them. Returns a counts
+        dict for logging. VACUUM is left to the caller — it's expensive and
+        usually only worth it after a large prune."""
+        cutoff = f"-{int(days)} days"
+        async with self.conn.execute(
+            "SELECT thread_id FROM sessions "
+            "WHERE state = 'closed' AND last_activity < datetime('now', ?)",
+            (cutoff,),
+        ) as cur:
+            rows = await cur.fetchall()
+        thread_ids = [int(r[0]) for r in rows]
+        if not thread_ids:
+            return {"sessions": 0, "message_log": 0, "pending_permissions": 0}
+        # Use one transaction so a partial prune can't leave dangling FK rows.
+        placeholders = ",".join("?" for _ in thread_ids)
+        async with self.conn.execute(
+            f"SELECT COUNT(*) FROM message_log WHERE thread_id IN ({placeholders})",
+            tuple(thread_ids),
+        ) as cur:
+            ml_count = (await cur.fetchone())[0]
+        async with self.conn.execute(
+            f"SELECT COUNT(*) FROM pending_permissions WHERE thread_id IN ({placeholders})",
+            tuple(thread_ids),
+        ) as cur:
+            pp_count = (await cur.fetchone())[0]
+        await self.conn.execute(
+            f"DELETE FROM message_log WHERE thread_id IN ({placeholders})",
+            tuple(thread_ids),
+        )
+        await self.conn.execute(
+            f"DELETE FROM pending_permissions WHERE thread_id IN ({placeholders})",
+            tuple(thread_ids),
+        )
+        await self.conn.execute(
+            f"DELETE FROM sessions WHERE thread_id IN ({placeholders})",
+            tuple(thread_ids),
+        )
+        await self.conn.commit()
+        log.info(
+            "db.pruned_old_closed",
+            sessions=len(thread_ids),
+            message_log=ml_count,
+            pending_permissions=pp_count,
+            days=days,
+        )
+        return {
+            "sessions": len(thread_ids),
+            "message_log": ml_count,
+            "pending_permissions": pp_count,
+        }
+
+    async def vacuum(self) -> None:
+        """Reclaim disk space after a large prune. Blocks reads/writes for the
+        duration; usually fast (<1s on tens of MB)."""
+        await self.conn.execute("VACUUM")
+        await self.conn.commit()
+
     async def get_session(self, thread_id: int) -> Optional[SessionRow]:
         async with self.conn.execute(
             "SELECT thread_id, project_name, cwd, sdk_session_id, permission_mode, state, "

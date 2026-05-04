@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import os
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -3426,6 +3427,38 @@ class BridgeBot:
         return asyncio.create_task(
             self._health_check_loop(), name="bridge-health-check"
         )
+
+    # DB prune: closed sessions older than this are deleted along with their
+    # message_log + pending_permissions rows. Daemon runs once per
+    # PRUNE_INTERVAL_S (default 24h). Both knobs are env-overridable.
+    PRUNE_RETENTION_DAYS = int(os.environ.get("CT_PRUNE_RETENTION_DAYS", "90"))
+    PRUNE_INTERVAL_S = int(os.environ.get("CT_PRUNE_INTERVAL_S", str(24 * 3600)))
+    # VACUUM after a prune that freed at least this many sessions — vacuum is
+    # cheap on small DBs but not free, no point doing it for a single row.
+    PRUNE_VACUUM_THRESHOLD = 50
+
+    async def _prune_loop(self) -> None:
+        # Stagger: wait once at boot before the first pass so we don't hit
+        # the DB while sessions are still restoring.
+        try:
+            await asyncio.sleep(300)  # 5 min
+        except asyncio.CancelledError:
+            return
+        while True:
+            try:
+                counts = await self.db.prune_old_closed(days=self.PRUNE_RETENTION_DAYS)
+                if counts["sessions"] >= self.PRUNE_VACUUM_THRESHOLD:
+                    await self.db.vacuum()
+                    log.info("prune.vacuumed", after_sessions=counts["sessions"])
+            except Exception:
+                log.exception("prune.tick_failed")
+            try:
+                await asyncio.sleep(self.PRUNE_INTERVAL_S)
+            except asyncio.CancelledError:
+                return
+
+    def start_prune_daemon(self) -> asyncio.Task:
+        return asyncio.create_task(self._prune_loop(), name="bridge-prune")
 
     async def shutdown(self) -> None:
         for s in self.sessions.all():
