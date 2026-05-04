@@ -3220,29 +3220,48 @@ class BridgeBot:
 
     # ---- runner-side callbacks ---------------------------------------------
 
-    async def on_runner_reconnect(self, name: str, sids: list[str]) -> None:
-        """Called by RunnerPool after a runner's WS reconnects. Post a sticky
-        note in each topic whose session was just re-opened with resume=."""
-        log.info("bridge.runner_reconnected", name=name, sessions=sids)
-        for sid in sids:
-            try:
-                thread_id = int(sid)
-            except ValueError:
-                continue
-            session = self.sessions.get(thread_id)
-            if session is None:
-                continue
-            try:
-                await self.bot.send_message(
-                    chat_id=self.settings.telegram_chat_id,
-                    message_thread_id=thread_id,
-                    text=(
-                        f"⚡ runner {name!r} reconnected — session resumed.\n"
-                        f"any in-flight turn was lost; re-send your last message if needed."
-                    ),
-                )
-            except Exception:
-                log.exception("bridge.reconnect_announce_failed", thread_id=thread_id)
+    # Outages shorter than this are silenced (laptop sleep/wake typically
+    # drops the WS for 10–30s and produces pure noise). Longer outages get
+    # ONE notice in General — not per-topic — since the per-topic notice
+    # cluttered chats and the in-flight turn already gets a "runner dropped"
+    # error inline via the streaming renderer when relevant.
+    _RECONNECT_NOTICE_THRESHOLD_S = 300.0  # 5 min
+
+    @staticmethod
+    def _humanize_duration(seconds: float) -> str:
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        if seconds < 3600:
+            return f"{int(seconds // 60)}m"
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"{h}h {m}m" if m else f"{h}h"
+
+    async def on_runner_reconnect(
+        self, name: str, sids: list[str], outage_seconds: float
+    ) -> None:
+        """Called by RunnerPool after a runner's WS reconnects. Silent for
+        short outages (sleep/wake blips); posts ONE notice in General when
+        the outage was long enough that the user probably wants to know."""
+        log.info(
+            "bridge.runner_reconnected",
+            name=name,
+            sessions=len(sids),
+            outage_seconds=round(outage_seconds, 1),
+        )
+        if outage_seconds < self._RECONNECT_NOTICE_THRESHOLD_S:
+            return
+        try:
+            await self.bot.send_message(
+                chat_id=self.settings.telegram_chat_id,
+                text=(
+                    f"⚡ runner {name!r} reconnected after "
+                    f"{self._humanize_duration(outage_seconds)} outage — "
+                    f"{len(sids)} session(s) resumed."
+                ),
+            )
+        except Exception:
+            log.exception("bridge.reconnect_announce_failed", runner=name)
 
     async def on_runner_idle_reaped(self, name: str, sid: str) -> None:
         """Called when the runner's idle reaper closes a session. The SDK CLI

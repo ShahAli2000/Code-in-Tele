@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
@@ -252,13 +253,17 @@ class RunnerConnection:
         host: str,
         port: int,
         secret: bytes | None,
-        on_reconnect: Callable[[str, list[str]], Awaitable[None]] | None = None,
+        on_reconnect: Callable[[str, list[str], float], Awaitable[None]] | None = None,
         on_idle_reaped: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
         self.name = name
         self.host = host
         self.port = port
         self.secret = secret
+        # on_reconnect signature: (runner_name, reopened_sids, outage_seconds).
+        # outage_seconds is 0.0 if disconnect timestamp wasn't captured (e.g.
+        # very first connect path takes a different code branch than
+        # _reader_loop → _reconnect_loop).
         self.on_reconnect = on_reconnect
         # Invoked when the runner sends T_CLOSED with reason="idle_reaped" —
         # i.e. the SDK CLI subprocess was freed after long inactivity. Args:
@@ -278,6 +283,10 @@ class RunnerConnection:
         # in the same frame as the message; last_ping_ms is the round-trip.
         self.last_ping_ok_ts: float | None = None
         self.last_ping_ms: float | None = None
+        # Monotonic timestamp of the last WS drop. Set in _on_disconnect,
+        # cleared after _reconnect_loop fires on_reconnect. None means we're
+        # currently connected (or never been connected at all).
+        self._disconnected_at: float | None = None
 
     @property
     def url(self) -> str:
@@ -357,6 +366,11 @@ class RunnerConnection:
             will_reconnect=self._auto_reconnect,
         )
         self._ws = None
+        # Stamp the drop time so _reconnect_loop can compute outage duration.
+        # Don't overwrite an existing stamp: a flapping reconnect cycle should
+        # report total downtime since the FIRST drop, not the most recent retry.
+        if self._disconnected_at is None:
+            self._disconnected_at = time.monotonic()
         # Fail any in-flight turns so iterators exit cleanly.
         for state in self._sessions.values():
             if state.turn_queue is not None:
@@ -412,9 +426,15 @@ class RunnerConnection:
                     sessions=len(self._sessions),
                 )
                 reopened = await self._reopen_sessions()
+                outage_seconds = (
+                    time.monotonic() - self._disconnected_at
+                    if self._disconnected_at is not None
+                    else 0.0
+                )
+                self._disconnected_at = None
                 if self.on_reconnect is not None and reopened:
                     try:
-                        await self.on_reconnect(self.name, reopened)
+                        await self.on_reconnect(self.name, reopened, outage_seconds)
                     except Exception:
                         log.exception("runner_client.on_reconnect_callback_failed")
                 return
@@ -786,7 +806,7 @@ class RunnerPool:
     def __init__(
         self,
         secret: bytes | None,
-        on_reconnect: Callable[[str, list[str]], Awaitable[None]] | None = None,
+        on_reconnect: Callable[[str, list[str], float], Awaitable[None]] | None = None,
         on_idle_reaped: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
         self.secret = secret
