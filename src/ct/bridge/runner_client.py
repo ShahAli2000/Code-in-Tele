@@ -253,12 +253,17 @@ class RunnerConnection:
         port: int,
         secret: bytes | None,
         on_reconnect: Callable[[str, list[str]], Awaitable[None]] | None = None,
+        on_idle_reaped: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
         self.name = name
         self.host = host
         self.port = port
         self.secret = secret
         self.on_reconnect = on_reconnect
+        # Invoked when the runner sends T_CLOSED with reason="idle_reaped" —
+        # i.e. the SDK CLI subprocess was freed after long inactivity. Args:
+        # (runner_name, sid). The bot uses this to surface a notice in the topic.
+        self.on_idle_reaped = on_idle_reaped
         self._ws: ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
@@ -471,6 +476,15 @@ class RunnerConnection:
             state.closed.set()
             if state.turn_queue is not None:
                 state.turn_queue.put_nowait(None)
+            reason = env.payload.get("reason") if isinstance(env.payload, dict) else None
+            if reason == "idle_reaped" and self.on_idle_reaped is not None:
+                try:
+                    await self.on_idle_reaped(self.name, env.id)
+                except Exception:
+                    log.exception(
+                        "runner_client.on_idle_reaped_failed",
+                        name=self.name, sid=env.id,
+                    )
             return
         if env.type == T_SDK_ID:
             sid_value = env.payload.get("sdk_session_id")
@@ -773,9 +787,11 @@ class RunnerPool:
         self,
         secret: bytes | None,
         on_reconnect: Callable[[str, list[str]], Awaitable[None]] | None = None,
+        on_idle_reaped: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
         self.secret = secret
         self.on_reconnect = on_reconnect
+        self.on_idle_reaped = on_idle_reaped
         self._connections: dict[str, RunnerConnection] = {}
 
     async def add_runner(
@@ -803,6 +819,7 @@ class RunnerPool:
                 port=port,
                 secret=self.secret,
                 on_reconnect=self.on_reconnect,
+                on_idle_reaped=self.on_idle_reaped,
             )
             try:
                 await conn.connect()

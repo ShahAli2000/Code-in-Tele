@@ -38,6 +38,7 @@ import os
 import pathlib
 import signal
 import sys
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -401,21 +402,51 @@ class RunnerSession:
     runner: SessionRunner | None = None
     turn_task: asyncio.Task[None] | None = None
     closed: bool = False
+    # Monotonic timestamp of last user-facing activity. Bumped on T_SEND and on
+    # outbound SDK messages during a turn. The idle reaper compares this against
+    # `time.monotonic()` to decide whether to free a long-quiet session.
+    last_activity: float = 0.0
+
+
+# Idle-session reaper: free the ClaudeSDKClient (and its ~170MB CLI subprocess)
+# when a session has been silent for this long. The bridge keeps its DB row
+# and the user can /resume on next interaction.
+_IDLE_REAP_MINUTES = float(os.environ.get("CT_IDLE_REAP_MINUTES", "30"))
+_REAPER_INTERVAL_S = float(os.environ.get("CT_REAPER_INTERVAL_S", "60"))
 
 
 class RunnerConnection:
     """One bridge ↔ runner WebSocket. Owns N session runners multiplexed by sid."""
 
-    def __init__(self, ws: ServerConnection, secret: bytes | None) -> None:
+    def __init__(
+        self,
+        ws: ServerConnection,
+        secret: bytes | None,
+        *,
+        idle_reap_minutes: float = _IDLE_REAP_MINUTES,
+        reaper_interval_s: float = _REAPER_INTERVAL_S,
+    ) -> None:
         self.ws = ws
         self.secret = secret
         self.sessions: dict[str, RunnerSession] = {}
         self._send_lock = asyncio.Lock()
         self._next_seq = 0
+        self._idle_reap_seconds = idle_reap_minutes * 60.0
+        self._reaper_interval_s = reaper_interval_s
+        self._reaper_task: asyncio.Task[None] | None = None
 
     async def serve(self) -> None:
         peer = getattr(self.ws, "remote_address", "?")
-        log.info("runner.connection_opened", peer=str(peer))
+        log.info(
+            "runner.connection_opened",
+            peer=str(peer),
+            idle_reap_minutes=self._idle_reap_seconds / 60.0,
+        )
+        # Start the idle reaper alongside the read loop. Cancelled in _teardown.
+        if self._idle_reap_seconds > 0:
+            self._reaper_task = asyncio.create_task(
+                self._reaper_loop(), name="runner-idle-reaper"
+            )
         try:
             async for raw in self.ws:
                 if not isinstance(raw, str):
@@ -437,6 +468,12 @@ class RunnerConnection:
             log.info("runner.connection_closed", peer=str(peer))
 
     async def _teardown(self) -> None:
+        # Stop the reaper first so it can't race with us closing sessions.
+        if self._reaper_task is not None and not self._reaper_task.done():
+            self._reaper_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reaper_task
+            self._reaper_task = None
         for s in list(self.sessions.values()):
             s.closed = True
             if s.turn_task is not None and not s.turn_task.done():
@@ -447,6 +484,59 @@ class RunnerConnection:
                 with contextlib.suppress(Exception):
                     await s.runner.stop()
         self.sessions.clear()
+
+    async def _reaper_loop(self) -> None:
+        """Periodically close sessions that have been silent for too long.
+
+        Frees the underlying ClaudeSDKClient (and ~170MB of CLI subprocess RSS).
+        The bridge sees a T_CLOSED with reason="idle_reaped" — its DB row is
+        kept and the user can /resume to re-open with resume=sdk_session_id.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self._reaper_interval_s)
+                now = time.monotonic()
+                to_reap: list[str] = []
+                for sid, sess in self.sessions.items():
+                    if sess.closed or sess.runner is None:
+                        continue
+                    # Don't reap a session with a turn in flight, even if its
+                    # last_activity is stale — a long Claude turn with no
+                    # outbound messages yet shouldn't get yanked.
+                    if sess.turn_task is not None and not sess.turn_task.done():
+                        continue
+                    if now - sess.last_activity >= self._idle_reap_seconds:
+                        to_reap.append(sid)
+                for sid in to_reap:
+                    await self._reap_session(sid)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("runner.reaper_failed")
+
+    async def _reap_session(self, sid: str) -> None:
+        session = self.sessions.pop(sid, None)
+        if session is None:
+            return
+        idle_for = time.monotonic() - session.last_activity
+        log.info(
+            "runner.session_idle_reaped",
+            sid=sid,
+            sdk_session_id=getattr(session.runner, "session_id", None),
+            idle_seconds=round(idle_for, 1),
+        )
+        session.closed = True
+        if session.turn_task is not None and not session.turn_task.done():
+            session.turn_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await session.turn_task
+        if session.runner is not None:
+            with contextlib.suppress(Exception):
+                await session.runner.stop()
+        with contextlib.suppress(Exception):
+            await self._send(
+                Envelope(T_CLOSED, sid, closed_payload(reason="idle_reaped"))
+            )
 
     async def _send(self, env: Envelope) -> None:
         self._next_seq += 1
@@ -517,7 +607,7 @@ class RunnerConnection:
             await self._send_error(env.id, "bad_request", "cwd is required")
             return
 
-        session = RunnerSession(sid=env.id)
+        session = RunnerSession(sid=env.id, last_activity=time.monotonic())
         self.sessions[env.id] = session
 
         async def perm_handler(req: PermissionRequest) -> None:
@@ -578,12 +668,16 @@ class RunnerConnection:
         if session.turn_task is not None and not session.turn_task.done():
             await self._send_error(env.id, "busy", "turn already in flight")
             return
+        session.last_activity = time.monotonic()
         session.turn_task = asyncio.create_task(self._drive_turn(session, text))
 
     async def _drive_turn(self, session: RunnerSession, text: str) -> None:
         assert session.runner is not None
         try:
             async for msg in session.runner.turn(text):
+                # Bump on every SDK message — keeps long Claude turns (e.g.
+                # multi-tool sequences) from being reaped while still working.
+                session.last_activity = time.monotonic()
                 if isinstance(msg, ResultMessage):
                     break
                 for out in translate_sdk_message(msg, session.sid):
@@ -931,8 +1025,19 @@ class RunnerConnection:
 
 
 async def run(host: str, port: int, secret: bytes | None) -> int:
+    # Track every live connection so SIGTERM can tear them down (and their
+    # ClaudeSDKClient subprocesses) cleanly before exit. Without this, a
+    # launchd-driven restart can leave the `claude` children reparented to
+    # PID 1 with no chance to disconnect.
+    active: set[RunnerConnection] = set()
+
     async def handler(ws: ServerConnection) -> None:
-        await RunnerConnection(ws, secret).serve()
+        conn = RunnerConnection(ws, secret)
+        active.add(conn)
+        try:
+            await conn.serve()
+        finally:
+            active.discard(conn)
 
     log.info("runner.starting", host=host, port=port, signed=secret is not None)
     stop_event = asyncio.Event()
@@ -948,5 +1053,27 @@ async def run(host: str, port: int, secret: bytes | None) -> int:
     async with serve(handler, host, port):
         log.info("runner.listening", host=host, port=port)
         await stop_event.wait()
+        log.info("runner.shutdown_starting", live_connections=len(active))
+        # Best-effort graceful teardown: each connection's _teardown stops the
+        # reaper, cancels in-flight turns, and disconnects the SDK client.
+        # Bounded by an outer timeout so a hung disconnect can't hold launchd's
+        # ExitTimeOut window.
+        async def _close(conn: RunnerConnection) -> None:
+            with contextlib.suppress(Exception):
+                await conn._teardown()
+            with contextlib.suppress(Exception):
+                await conn.ws.close()
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *(_close(c) for c in list(active)), return_exceptions=True
+                ),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "runner.shutdown_timeout", live_connections=len(active)
+            )
     log.info("runner.stopped")
     return 0

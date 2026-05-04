@@ -173,11 +173,13 @@ class BridgeBot:
         self.db = db
         self.runners = runner_pool
         self.runners.on_reconnect = self.on_runner_reconnect
+        self.runners.on_idle_reaped = self.on_runner_idle_reaped
         # Wire the callback onto any RunnerConnections that already exist
         # (main.py adds the studio runner + DB-registered macs before
         # constructing the bridge, so they were created with on_reconnect=None).
         for _conn in self.runners._connections.values():  # type: ignore[attr-defined]
             _conn.on_reconnect = self.on_runner_reconnect
+            _conn.on_idle_reaped = self.on_runner_idle_reaped
         self.default_runner = default_runner
         self.started_at = datetime.now(timezone.utc)
         self.sessions = SessionStore(db)
@@ -3241,6 +3243,31 @@ class BridgeBot:
                 )
             except Exception:
                 log.exception("bridge.reconnect_announce_failed", thread_id=thread_id)
+
+    async def on_runner_idle_reaped(self, name: str, sid: str) -> None:
+        """Called when the runner's idle reaper closes a session. The SDK CLI
+        subprocess has been freed; mark the session orphaned so /resume picks
+        it up and the user can re-attach with the original sdk_session_id."""
+        log.info("bridge.session_idle_reaped", runner=name, sid=sid)
+        try:
+            thread_id = int(sid)
+        except ValueError:
+            return
+        if self.sessions.get(thread_id) is None:
+            return
+        with contextlib.suppress(Exception):
+            await self.db.mark_orphaned(thread_id, reason="idle_reaped")
+        try:
+            await self.bot.send_message(
+                chat_id=self.settings.telegram_chat_id,
+                message_thread_id=thread_id,
+                text=(
+                    "💤 Session paused after 30+ min idle to free resources.\n"
+                    "Run /resume to re-attach this session and continue."
+                ),
+            )
+        except Exception:
+            log.exception("bridge.idle_reap_announce_failed", thread_id=thread_id)
 
     def _make_id_persister(
         self, thread_id: int
