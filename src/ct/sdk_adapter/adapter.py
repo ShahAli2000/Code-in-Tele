@@ -158,6 +158,7 @@ class SessionRunner:
         max_turns: int | None = None,
         max_budget_usd: float | None = None,
         fallback_model: str | None = None,
+        on_pre_compact: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.cwd = cwd
         self.permission_mode: PermissionMode = permission_mode
@@ -184,6 +185,7 @@ class SessionRunner:
             if fallback_model is not None
             else (_DEFAULT_FALLBACK_MODEL or None)
         )
+        self.on_pre_compact = on_pre_compact
         # Tools the user has pre-trusted bot-wide (or per-profile, when that
         # plumbing arrives). Same in-memory set as approve-and-remember
         # populates at runtime — same trust ledger, different seed source.
@@ -256,7 +258,14 @@ class SessionRunner:
             hooks={
                 "PreToolUse": [
                     HookMatcher(matcher=None, hooks=[self._keep_open_hook])
-                ]
+                ],
+                # Best-effort heads-up before the SDK compacts conversation
+                # history. The bridge posts "📦 compacting…" in the topic so
+                # the user knows quality may shift; without this the user just
+                # sees Claude lose context mid-stream.
+                "PreCompact": [
+                    HookMatcher(matcher=None, hooks=[self._pre_compact_hook])
+                ],
             },
         )
         if self.model is not None:
@@ -464,6 +473,21 @@ class SessionRunner:
         input_data: Any, tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
         """Required no-op PreToolUse hook so can_use_tool fires in Python."""
+        return {"continue_": True}
+
+    async def _pre_compact_hook(
+        self, input_data: Any, tool_use_id: str | None, context: Any
+    ) -> dict[str, Any]:
+        """Fires before SDK conversation compaction. Notify the runner so it
+        can emit a T_PRECOMPACT envelope; return continue_=True so we don't
+        block the SDK's own decision."""
+        if self.on_pre_compact is not None:
+            try:
+                await self.on_pre_compact()
+            except Exception:
+                log.exception(
+                    "session.pre_compact_callback_failed", session_id=self.session_id
+                )
         return {"continue_": True}
 
     def _on_sdk_stderr(self, line: str) -> None:

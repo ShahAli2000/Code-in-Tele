@@ -72,6 +72,7 @@ from ct.protocol.envelopes import (
     T_OPENED,
     T_PERMISSION_REQUEST,
     T_PING,
+    T_PRECOMPACT,
     T_SDK_ID,
     T_SEND,
     T_SET_MODE,
@@ -272,6 +273,7 @@ class RunnerConnection:
         secret: bytes | None,
         on_reconnect: Callable[[str, list[str], float], Awaitable[None]] | None = None,
         on_idle_reaped: Callable[[str, str], Awaitable[None]] | None = None,
+        on_pre_compact: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
         self.name = name
         self.host = host
@@ -286,6 +288,9 @@ class RunnerConnection:
         # i.e. the SDK CLI subprocess was freed after long inactivity. Args:
         # (runner_name, sid). The bot uses this to surface a notice in the topic.
         self.on_idle_reaped = on_idle_reaped
+        # Invoked when the runner sends T_PRECOMPACT — the SDK is about to
+        # compact the conversation history for a session. (runner_name, sid).
+        self.on_pre_compact = on_pre_compact
         self._ws: ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
@@ -534,6 +539,15 @@ class RunnerConnection:
                         log.exception(
                             "runner_client.id_handler_failed", sid=env.id
                         )
+            return
+        if env.type == T_PRECOMPACT:
+            if self.on_pre_compact is not None:
+                try:
+                    await self.on_pre_compact(self.name, env.id)
+                except Exception:
+                    log.exception(
+                        "runner_client.pre_compact_failed", sid=env.id
+                    )
             return
         if env.type == T_PERMISSION_REQUEST:
             if state.on_permission_request is not None:
@@ -825,10 +839,12 @@ class RunnerPool:
         secret: bytes | None,
         on_reconnect: Callable[[str, list[str], float], Awaitable[None]] | None = None,
         on_idle_reaped: Callable[[str, str], Awaitable[None]] | None = None,
+        on_pre_compact: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> None:
         self.secret = secret
         self.on_reconnect = on_reconnect
         self.on_idle_reaped = on_idle_reaped
+        self.on_pre_compact = on_pre_compact
         self._connections: dict[str, RunnerConnection] = {}
 
     async def add_runner(
@@ -857,6 +873,7 @@ class RunnerPool:
                 secret=self.secret,
                 on_reconnect=self.on_reconnect,
                 on_idle_reaped=self.on_idle_reaped,
+                on_pre_compact=self.on_pre_compact,
             )
             try:
                 await conn.connect()

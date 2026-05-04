@@ -91,6 +91,7 @@ from ct.protocol.envelopes import (
     T_OPENED,
     T_PERMISSION_REQUEST,
     T_PING,
+    T_PRECOMPACT,
     T_PONG,
     T_SDK_ID,
     T_SEND,
@@ -686,6 +687,9 @@ class RunnerConnection:
         async def id_persister(sdk_session_id: str) -> None:
             await self._send(Envelope(T_SDK_ID, env.id, sdk_id_payload(sdk_session_id)))
 
+        async def pre_compact_handler() -> None:
+            await self._send(Envelope(T_PRECOMPACT, env.id, {}))
+
         auto_allow_set: set[str] = (
             {t for t in auto_allow_tools if isinstance(t, str) and t}
             if isinstance(auto_allow_tools, list) else set()
@@ -701,6 +705,7 @@ class RunnerConnection:
             auto_allow_tools=auto_allow_set,
             on_permission_request=perm_handler,
             on_session_id_assigned=id_persister,
+            on_pre_compact=pre_compact_handler,
         )
         session.runner = runner
         try:

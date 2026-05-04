@@ -45,7 +45,7 @@ ALL_TYPES: frozenset[str] = frozenset({
     T_OPEN, T_SEND, T_DECIDE, T_SET_MODE, T_INTERRUPT, T_CLOSE, T_PING,
     "set_model",
     "list_dir", "mkdir", "upload", "fork", "get_logs", "export", "get_file",
-    "search", "get_context", "context",
+    "search", "get_context", "context", "precompact",
     T_OPENED, T_SDK_ID, T_TEXT, T_TOOL_USE, T_TOOL_RESULT, T_THINKING,
     T_SYSTEM, T_PERMISSION_REQUEST, T_TURN_END, T_CLOSED, T_ERROR, T_PONG,
     "dir_listing", "mkdir_ok", "upload_ok", "fork_ok", "logs", "export_ok",
@@ -185,6 +185,10 @@ T_FILE = "file"                    # runner → bridge: payload {path, content_b
 T_SEARCH = "search"                # bridge → runner: payload {pattern, max_results}
 T_SEARCH_RESULTS = "search_results"
 # runner → bridge: payload {matches: [{sdk_session_id, role, snippet, project_name}]}
+
+# PreCompact: SDK is about to compact the conversation history. Emitted as a
+# best-effort heads-up so the bridge can post "📦 compacting…" in the topic.
+T_PRECOMPACT = "precompact"
 
 # /context — bridge requests the SDK's context-usage breakdown for a session.
 # Result is a snapshot, not a subscription.

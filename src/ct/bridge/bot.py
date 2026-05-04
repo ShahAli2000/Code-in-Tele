@@ -175,12 +175,14 @@ class BridgeBot:
         self.runners = runner_pool
         self.runners.on_reconnect = self.on_runner_reconnect
         self.runners.on_idle_reaped = self.on_runner_idle_reaped
+        self.runners.on_pre_compact = self.on_runner_pre_compact
         # Wire the callback onto any RunnerConnections that already exist
         # (main.py adds the studio runner + DB-registered macs before
         # constructing the bridge, so they were created with on_reconnect=None).
         for _conn in self.runners._connections.values():  # type: ignore[attr-defined]
             _conn.on_reconnect = self.on_runner_reconnect
             _conn.on_idle_reaped = self.on_runner_idle_reaped
+            _conn.on_pre_compact = self.on_runner_pre_compact
         self.default_runner = default_runner
         self.started_at = datetime.now(timezone.utc)
         self.sessions = SessionStore(db)
@@ -3307,6 +3309,26 @@ class BridgeBot:
             )
         except Exception:
             log.exception("bridge.reconnect_announce_failed", runner=name)
+
+    async def on_runner_pre_compact(self, name: str, sid: str) -> None:
+        """Called when the SDK is about to compact this session's
+        conversation history. Heads-up notice in the topic so the user knows
+        Claude's context is shifting (response quality may change after)."""
+        log.info("bridge.session_pre_compact", runner=name, sid=sid)
+        try:
+            thread_id = int(sid)
+        except ValueError:
+            return
+        if self.sessions.get(thread_id) is None:
+            return
+        try:
+            await self.bot.send_message(
+                chat_id=self.settings.telegram_chat_id,
+                message_thread_id=thread_id,
+                text="📦 conversation compacting — older history will be summarised, recent turns kept.",
+            )
+        except Exception:
+            log.exception("bridge.pre_compact_announce_failed", thread_id=thread_id)
 
     async def on_runner_idle_reaped(self, name: str, sid: str) -> None:
         """Called when the runner's idle reaper closes a session. The SDK CLI
