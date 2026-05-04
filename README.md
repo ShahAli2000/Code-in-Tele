@@ -162,6 +162,29 @@ Then in Telegram, register the new host with the bridge:
 
 Now `/new myproj mac=laptop` opens a session on the laptop runner.
 
+## Upgrading
+
+```bash
+bash deploy/upgrade.sh
+```
+
+That runs `git pull --ff-only`, `uv sync`, and reloads whichever services are installed on this host (bridge and/or runner). Schema migrations are forward-only `ALTER TABLE`s and run automatically when the bridge boots — no separate DB step.
+
+**Multi-host fleets:** run upgrade on **runners first**, then the bridge. A newer bridge can emit protocol envelopes that an older runner rejects as unknown; newer runners still understand older bridges.
+
+```bash
+# on every runner host
+ssh ali@runner-host 'cd ~/Code-in-Tele && bash deploy/upgrade.sh'
+# then on the bridge host
+ssh ali@bridge-host 'cd ~/Code-in-Tele && bash deploy/upgrade.sh'
+```
+
+**Common preconditions:**
+
+- The script refuses to run with a dirty working tree. Commit, stash, or discard first. (Override: `FORCE=1 bash deploy/upgrade.sh`, not recommended.)
+- Pulling from a non-main branch: `BRANCH=develop bash deploy/upgrade.sh`.
+- After major-version bumps, glance at `.env.example` for any new variables to add to your `.env`.
+
 ## Configuration reference
 
 All settings come from `.env`. See [`.env.example`](.env.example) for inline comments. Key vars:
