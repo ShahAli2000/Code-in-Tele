@@ -1133,7 +1133,11 @@ async def run(host: str, port: int, secret: bytes | None) -> int:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _on_signal, sig)
 
-    async with serve(handler, host, port):
+    # max_size = 32 MiB. Telegram caps bot uploads at 20MB and we sometimes
+    # ship those over the WS as base64-padded uploads (~26MB). 32 MiB gives
+    # headroom; default is 1 MiB which would silently drop big uploads. Also
+    # caps any malicious 1 GiB envelope at a fixed allocation ceiling.
+    async with serve(handler, host, port, max_size=32 * 1024 * 1024):
         log.info("runner.listening", host=host, port=port)
         await stop_event.wait()
         log.info("runner.shutdown_starting", live_connections=len(active))

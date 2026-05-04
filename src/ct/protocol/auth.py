@@ -18,11 +18,19 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 
 from ct.protocol.envelopes import Envelope, ProtocolError
 
 _HEX_SIG_LEN = 64  # SHA-256 → 32 bytes → 64 hex chars
 _FRAME_SEP = ":"
+# Reject envelopes whose `ts` is more than this far from now, in either
+# direction. The ts is part of the signed body, so an attacker can't change it
+# without invalidating the signature — this gates against replays of captured
+# legitimate envelopes. ±60s tolerates clock skew between Macs (NTP-synced
+# typically <1s, this gives 60× headroom). Disabled when secret is None
+# (Phase 2 dev mode where signing is skipped anyway).
+_MAX_TS_SKEW_S = 60.0
 
 
 def sign(secret: bytes, body: str) -> str:
@@ -62,4 +70,11 @@ def unframe(line: str, secret: bytes | None) -> Envelope:
         # body but log nothing here (callers can warn if they care).
         pass
 
-    return Envelope.from_json(body)
+    env = Envelope.from_json(body)
+    if secret is not None:
+        skew = time.time() - env.ts
+        if abs(skew) > _MAX_TS_SKEW_S:
+            raise ProtocolError(
+                f"envelope timestamp {skew:+.1f}s outside ±{_MAX_TS_SKEW_S:.0f}s window"
+            )
+    return env
