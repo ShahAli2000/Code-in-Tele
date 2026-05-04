@@ -415,6 +415,41 @@ _IDLE_REAP_MINUTES = float(os.environ.get("CT_IDLE_REAP_MINUTES", "30"))
 _REAPER_INTERVAL_S = float(os.environ.get("CT_REAPER_INTERVAL_S", "60"))
 
 
+# Filesystem containment for the runner's file ops (list_dir, mkdir, upload,
+# get_file). Defence-in-depth on top of HMAC + Tailscale: even with a
+# compromised bridge or HMAC secret leak, an attacker can only touch paths
+# inside these roots — no `get_file /etc/passwd` or
+# `upload ~/.anthropic/assistant-key`. Default = $HOME (where Claude already
+# operates anyway via the Edit tool, so this doesn't reduce legitimate
+# capability). Override with CT_RUNNER_FS_ROOTS=/path1:/path2 if the runner
+# legitimately needs access outside $HOME (e.g. /Volumes/External, /tmp, a
+# work-tree on a separate disk).
+def _resolve_fs_roots() -> list[pathlib.Path]:
+    env_val = os.environ.get("CT_RUNNER_FS_ROOTS", "")
+    if env_val.strip():
+        roots = [pathlib.Path(p).expanduser().resolve() for p in env_val.split(":") if p.strip()]
+    else:
+        roots = [pathlib.Path.home().resolve()]
+    return roots
+
+
+_FS_ROOTS = _resolve_fs_roots()
+
+
+def _contain(path: pathlib.Path) -> pathlib.Path:
+    """Resolve `path` (following symlinks) and verify it stays inside one of
+    the configured FS roots. Returns the resolved path on success.
+    Raises ValueError if it escapes — caller surfaces as path_denied error."""
+    resolved = path.resolve(strict=False)
+    for root in _FS_ROOTS:
+        try:
+            resolved.relative_to(root)
+            return resolved
+        except ValueError:
+            continue
+    raise ValueError(f"path outside allowed roots: {resolved}")
+
+
 class RunnerConnection:
     """One bridge ↔ runner WebSocket. Owns N session runners multiplexed by sid."""
 
@@ -768,7 +803,14 @@ class RunnerConnection:
         if not isinstance(path_raw, str) or not path_raw:
             await self._send_error(env.id, "bad_request", "list_dir.path required")
             return
-        path = pathlib.Path(path_raw).expanduser()
+        if len(path_raw) > 4096:
+            await self._send_error(env.id, "bad_request", "list_dir.path too long")
+            return
+        try:
+            path = _contain(pathlib.Path(path_raw).expanduser())
+        except ValueError as exc:
+            await self._send_error(env.id, "path_denied", str(exc))
+            return
         try:
             if not path.is_dir():
                 await self._send_error(env.id, "not_a_dir", str(path))
@@ -801,7 +843,14 @@ class RunnerConnection:
         if not isinstance(path_raw, str) or not path_raw:
             await self._send_error(env.id, "bad_request", "mkdir.path required")
             return
-        path = pathlib.Path(path_raw).expanduser()
+        if len(path_raw) > 4096:
+            await self._send_error(env.id, "bad_request", "mkdir.path too long")
+            return
+        try:
+            path = _contain(pathlib.Path(path_raw).expanduser())
+        except ValueError as exc:
+            await self._send_error(env.id, "path_denied", str(exc))
+            return
         try:
             path.mkdir(parents=True, exist_ok=False)
         except FileExistsError:
@@ -829,7 +878,14 @@ class RunnerConnection:
         except (ValueError, base64.binascii.Error) as exc:
             await self._send_error(env.id, "bad_b64", str(exc))
             return
-        path = pathlib.Path(path_raw).expanduser()
+        if len(path_raw) > 4096:
+            await self._send_error(env.id, "bad_request", "upload.path too long")
+            return
+        try:
+            path = _contain(pathlib.Path(path_raw).expanduser())
+        except ValueError as exc:
+            await self._send_error(env.id, "path_denied", str(exc))
+            return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
@@ -852,7 +908,14 @@ class RunnerConnection:
         if not isinstance(path_raw, str) or not path_raw:
             await self._send_error(env.id, "bad_request", "get_file.path required")
             return
-        path = pathlib.Path(path_raw).expanduser()
+        if len(path_raw) > 4096:
+            await self._send_error(env.id, "bad_request", "get_file.path too long")
+            return
+        try:
+            path = _contain(pathlib.Path(path_raw).expanduser())
+        except ValueError as exc:
+            await self._send_error(env.id, "path_denied", str(exc))
+            return
         try:
             if not path.is_file():
                 await self._send_error(env.id, "not_a_file", str(path))
