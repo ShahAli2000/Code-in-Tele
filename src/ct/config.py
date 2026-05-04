@@ -90,6 +90,19 @@ def load_settings(*, dotenv_path: Path | None = None, force: bool = False) -> Se
         raise RuntimeError(
             "TELEGRAM_ALLOWED_USER_IDS is empty; the bot would reject every user."
         )
+    # Multi-user is intentionally unsupported. The bot's session ownership,
+    # dashboard ACL, and profiles/defaults are all global — adding a second
+    # user_id silently grants them access to every other user's sessions and
+    # transcripts. If you really want multi-user, opt in explicitly via env;
+    # but read CONTRIBUTING.md first because there are real changes you'll
+    # need to make to session ownership before it's safe.
+    if len(allowed) > 1 and os.environ.get("CT_ALLOW_MULTIPLE_USERS", "").strip() != "1":
+        raise RuntimeError(
+            f"TELEGRAM_ALLOWED_USER_IDS has {len(allowed)} users but the bot's "
+            "session model is single-user — every allowed user sees every other "
+            "allowed user's sessions, transcripts, and profile data. To bypass "
+            "this guard at your own risk, set CT_ALLOW_MULTIPLE_USERS=1."
+        )
 
     _settings = Settings(
         telegram_bot_token=_required("TELEGRAM_BOT_TOKEN"),
