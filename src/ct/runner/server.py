@@ -469,6 +469,10 @@ class RunnerConnection:
         self._idle_reap_seconds = idle_reap_minutes * 60.0
         self._reaper_interval_s = reaper_interval_s
         self._reaper_task: asyncio.Task[None] | None = None
+        # Track every per-envelope dispatch task. On WS drop, _teardown cancels
+        # them before walking sessions — without tracking, an in-flight dispatch
+        # can mutate self.sessions while teardown is clearing it (race).
+        self._dispatch_tasks: set[asyncio.Task[None]] = set()
 
     async def serve(self) -> None:
         peer = getattr(self.ws, "remote_address", "?")
@@ -493,7 +497,10 @@ class RunnerConnection:
                     continue
                 # Dispatch is fire-and-forget so a long-running send doesn't
                 # block decide / interrupt for the same or a different session.
-                asyncio.create_task(self._dispatch(env))
+                # Tracked so _teardown can cancel + await them on WS drop.
+                task = asyncio.create_task(self._dispatch(env))
+                self._dispatch_tasks.add(task)
+                task.add_done_callback(self._dispatch_tasks.discard)
         except websockets.ConnectionClosed:
             pass
         except Exception:
@@ -509,6 +516,19 @@ class RunnerConnection:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reaper_task
             self._reaper_task = None
+        # Cancel + drain any per-envelope dispatch tasks so they can't keep
+        # mutating self.sessions while we're tearing it down. Bounded wait —
+        # a stuck dispatch shouldn't hold launchd's exit window hostage.
+        if self._dispatch_tasks:
+            for task in list(self._dispatch_tasks):
+                if not task.done():
+                    task.cancel()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.gather(*self._dispatch_tasks, return_exceptions=True),
+                    timeout=3.0,
+                )
+            self._dispatch_tasks.clear()
         for s in list(self.sessions.values()):
             s.closed = True
             if s.turn_task is not None and not s.turn_task.done():
