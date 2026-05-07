@@ -538,14 +538,20 @@ class RunnerConnection:
             if state.turn_queue is not None:
                 state.turn_queue.put_nowait(None)
             reason = env.payload.get("reason") if isinstance(env.payload, dict) else None
-            if reason == "idle_reaped" and self.on_idle_reaped is not None:
-                try:
-                    await self.on_idle_reaped(self.name, env.id)
-                except Exception:
-                    log.exception(
-                        "runner_client.on_idle_reaped_failed",
-                        name=self.name, sid=env.id,
-                    )
+            if reason == "idle_reaped":
+                # Drop from the in-memory session map so the next auto-reconnect
+                # doesn't re-open the (now-orphaned) session — without this we'd
+                # loop forever: reap → reconnect re-opens → 30 min idle → reap.
+                # /resume re-creates a fresh entry from the orphaned DB row.
+                self._sessions.pop(env.id, None)
+                if self.on_idle_reaped is not None:
+                    try:
+                        await self.on_idle_reaped(self.name, env.id)
+                    except Exception:
+                        log.exception(
+                            "runner_client.on_idle_reaped_failed",
+                            name=self.name, sid=env.id,
+                        )
             return
         if env.type == T_SDK_ID:
             sid_value = env.payload.get("sdk_session_id")

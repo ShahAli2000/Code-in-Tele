@@ -97,6 +97,15 @@ class SessionStore:
         await self._db.mark_closed(thread_id)
         return self._by_thread.pop(thread_id, None)
 
+    def evict_in_memory(self, thread_id: int) -> TopicSession | None:
+        """Drop the in-memory entry without touching the DB. Used by the
+        idle-reaper notification path: the DB is already marked orphaned by
+        on_runner_idle_reaped; the in-memory entry holds a stale (closed)
+        SessionHandle that can't take turns anymore. Removing it forces
+        /resume to walk the orphaned-DB-row path which re-opens with
+        resume=sdk_session_id, getting a fresh handle."""
+        return self._by_thread.pop(thread_id, None)
+
     # ---- read paths (cheap, in-memory) -------------------------------------
 
     def get(self, thread_id: int) -> TopicSession | None:

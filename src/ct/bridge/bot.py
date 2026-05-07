@@ -3366,17 +3366,29 @@ class BridgeBot:
 
     async def on_runner_idle_reaped(self, name: str, sid: str) -> None:
         """Called when the runner's idle reaper closes a session. The SDK CLI
-        subprocess has been freed; mark the session orphaned so /resume picks
-        it up and the user can re-attach with the original sdk_session_id."""
+        subprocess has been freed; mark the session orphaned in DB and evict
+        the in-memory TopicSession so:
+          (a) the bridge's auto-reconnect doesn't re-open it (the runner_client
+              already pops from its _sessions map for the same reason),
+          (b) /resume's open_session call doesn't trip the "session already
+              open" guard,
+          (c) the user's next message in the topic falls into the "no session"
+              path instead of trying a stale handle that would error.
+        """
         log.info("bridge.session_idle_reaped", runner=name, sid=sid)
         try:
             thread_id = int(sid)
         except ValueError:
             return
         if self.sessions.get(thread_id) is None:
+            # Already evicted (e.g. user just /resume'd) — nothing to announce.
             return
         with contextlib.suppress(Exception):
             await self.db.mark_orphaned(thread_id, reason="idle_reaped")
+        # Drop the in-memory TopicSession. The handle is closed; keeping it
+        # around would loop the cycle (auto-reconnect re-opens, 30 min idle
+        # reaps again, ...). Already-shipped fix in runner_client also pops.
+        self.sessions.evict_in_memory(thread_id)
         try:
             await self.bot.send_message(
                 chat_id=self.settings.telegram_chat_id,
