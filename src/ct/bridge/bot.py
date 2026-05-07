@@ -1960,13 +1960,49 @@ class BridgeBot:
         )
 
     async def cmd_resume(self, message: Message) -> None:
-        """/resume — list orphaned sessions and offer re-attach buttons.
+        """/resume —
+        - In a session topic with an orphaned row → re-attach that session.
+        - In a session topic with an active row   → "already active".
+        - In General (or topic with no row)       → picker of orphaned sessions.
 
-        A session is orphaned when its runner was unreachable at bridge boot
-        (mac asleep, runner crashed). The DB row keeps `runner_name` and
-        `sdk_session_id` so we can re-open the SDK with resume= once the mac
-        is back online. Buttons are tagged with thread_id so they survive a
-        bridge restart (the row is still there)."""
+        A session is orphaned when its runner was unreachable at bridge boot,
+        when /idle-reaped, or when /move failed mid-flight. The DB row keeps
+        `runner_name` and `sdk_session_id` so we re-open with resume= once
+        the runner is back online.
+        """
+        thread_id = message.message_thread_id
+        in_topic = thread_id is not None and thread_id != GENERAL_TOPIC_ID
+
+        # In-topic: skip the picker and resume THIS topic's session.
+        if in_topic:
+            row = await self.db.get_session(thread_id)
+            if row is None:
+                await message.answer(
+                    "no session in this topic — use /new <name> in General to start one."
+                )
+                return
+            if row.state == "active":
+                await message.answer(
+                    "✓ session already active — no resume needed."
+                )
+                return
+            if row.state != "orphaned":
+                await message.answer(
+                    f"session state is {row.state!r}, can't resume "
+                    f"(only `orphaned` sessions can /resume)."
+                )
+                return
+            err = await self._resume_orphaned_row(row, thread_id)
+            if err is None:
+                await message.answer(
+                    f"✓ resumed {row.project_name!r} — transcript intact, "
+                    "ready for next turn."
+                )
+            else:
+                await message.answer(f"⚠ resume failed: {err}")
+            return
+
+        # General (or unknown topic): picker.
         rows = await self.db.list_orphaned_sessions()
         if not rows:
             await message.answer("✓ no orphaned sessions.")
@@ -1995,46 +2031,21 @@ class BridgeBot:
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         )
 
-    async def _handle_resume_callback(self, query: CallbackQuery) -> bool:
-        data = query.data or ""
-        if not data.startswith("ct:rsm:"):
-            return False
-        try:
-            thread_id = int(data[len("ct:rsm:"):])
-        except ValueError:
-            await query.answer("malformed")
-            return True
-        row = await self.db.get_session(thread_id)
-        if row is None:
-            await query.answer("no DB row", show_alert=True)
-            return True
-        if row.state != "orphaned":
-            await query.answer(f"state is {row.state!r}, not orphaned", show_alert=True)
-            return True
+    async def _resume_orphaned_row(
+        self, row: Any, thread_id: int
+    ) -> str | None:
+        """Re-open the SDK session described by `row` with resume=. Returns
+        None on success, or a short error message string. Shared by /resume
+        in-topic and the picker callback so both paths behave identically."""
         if not row.sdk_session_id:
-            await query.answer(
-                "no sdk_session_id — never had a first turn, nothing to resume",
-                show_alert=True,
-            )
-            return True
+            return "no sdk_session_id (never had a first turn, nothing to resume)"
         try:
             conn = self.runners.get(row.runner_name)
         except KeyError:
-            await query.answer(
-                f"runner {row.runner_name!r} is no longer registered — /macs add first",
-                show_alert=True,
-            )
-            return True
+            return f"runner {row.runner_name!r} no longer registered — /macs add first"
         if not conn.connected:
-            await query.answer(
-                f"{row.runner_name!r} isn't connected — wake it up and try again",
-                show_alert=True,
-            )
-            return True
+            return f"{row.runner_name!r} isn't connected — wake it up and try again"
 
-        # Walk the same open-session path /new uses, but with resume= and
-        # the persisted options off the row. perm_handler captures the new
-        # handle through the box trick so future approval cards route right.
         handle_box: list[SessionHandle] = []
 
         async def perm_handler(req: PermissionRequest) -> None:
@@ -2059,24 +2070,64 @@ class BridgeBot:
             )
         except Exception as exc:
             log.exception("resume.open_failed", thread_id=thread_id)
-            await query.answer(f"resume failed: {exc!s}", show_alert=True)
-            return True
+            return f"runner {row.runner_name!r} rejected open: {exc!s}"
         handle_box.append(handle)
 
         # sessions.add does INSERT OR REPLACE which flips state back to
         # 'active' and updates the in-memory map.
-        await self.sessions.add(TopicSession(
-            thread_id=thread_id,
-            project_name=row.project_name,
-            cwd=row.cwd,
-            runner=handle,
-            turn_lock=asyncio.Lock(),
-            runner_name=row.runner_name,
-            model=row.model,
-            effort=row.effort,
-            thinking=row.thinking,
-        ))
+        try:
+            await self.sessions.add(TopicSession(
+                thread_id=thread_id,
+                project_name=row.project_name,
+                cwd=row.cwd,
+                runner=handle,
+                turn_lock=asyncio.Lock(),
+                runner_name=row.runner_name,
+                model=row.model,
+                effort=row.effort,
+                thinking=row.thinking,
+            ))
+        except RuntimeError as exc:
+            # In-memory entry already present — most likely a stale handle
+            # from a prior reap that wasn't evicted (pre-fix sessions). Evict
+            # and retry once so the user isn't stuck.
+            if "already has a session" in str(exc):
+                self.sessions.evict_in_memory(thread_id)
+                await self.sessions.add(TopicSession(
+                    thread_id=thread_id,
+                    project_name=row.project_name,
+                    cwd=row.cwd,
+                    runner=handle,
+                    turn_lock=asyncio.Lock(),
+                    runner_name=row.runner_name,
+                    model=row.model,
+                    effort=row.effort,
+                    thinking=row.thinking,
+                ))
+            else:
+                raise
+        return None
 
+    async def _handle_resume_callback(self, query: CallbackQuery) -> bool:
+        data = query.data or ""
+        if not data.startswith("ct:rsm:"):
+            return False
+        try:
+            thread_id = int(data[len("ct:rsm:"):])
+        except ValueError:
+            await query.answer("malformed")
+            return True
+        row = await self.db.get_session(thread_id)
+        if row is None:
+            await query.answer("no DB row", show_alert=True)
+            return True
+        if row.state != "orphaned":
+            await query.answer(f"state is {row.state!r}, not orphaned", show_alert=True)
+            return True
+        err = await self._resume_orphaned_row(row, thread_id)
+        if err is not None:
+            await query.answer(f"resume failed: {err}", show_alert=True)
+            return True
         await query.answer(f"resumed {row.project_name}")
         # Confirm in the session's topic itself so the user sees the resume
         # in the right place when they switch to it.

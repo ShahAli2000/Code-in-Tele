@@ -290,7 +290,12 @@ class SessionRunner:
             options_kwargs["max_turns"] = self.max_turns
         if self.max_budget_usd and self.max_budget_usd > 0:
             options_kwargs["max_budget_usd"] = self.max_budget_usd
-        if self.fallback_model:
+        # Fallback model has to differ from the primary or the CLI exits with
+        # `Fallback model cannot be the same as the main model`. When the
+        # primary IS our fallback default (e.g. user explicitly picked Sonnet
+        # which is also the env default fallback), drop the fallback — there's
+        # nothing useful to fall back to anyway.
+        if self.fallback_model and self.fallback_model != self.model:
             options_kwargs["fallback_model"] = self.fallback_model
         # File checkpointing: enables ClaudeSDKClient.rewind_files() so the
         # bridge's /rewind can restore on-disk file state to the moment a
