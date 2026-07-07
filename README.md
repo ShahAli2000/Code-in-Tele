@@ -26,12 +26,13 @@ Built on the [Claude Agent SDK](https://docs.claude.com/en/agent-sdk/overview) a
 - **Multi-host fleet** — register additional Macs or Linux boxes with `/macs add NAME tailscale-ip`. Pick a runner per session: `/new myproject mac=laptop`. Each session lives on the runner's filesystem.
 - **Quiet UX** — chat shows your question, then the answer. Claude's tool use, intermediate reasoning, and thinking blocks live on the web dashboard, not in Telegram. Long turns get heartbeats (`working… (3m)`) instead of streaming clutter.
 - **Adaptive thinking on by default** — the SDK's adaptive-thinking budget is enabled per session. Toggle off with `/think off`.
-- **Permission cards** — destructive tool uses surface as inline `[Approve] [Approve + remember] [Deny]` buttons. The remember option scopes auto-allow to that tool name for the rest of the session.
-- **Web dashboard** — read-only view of every session, transcript, pending approval, recent activity. Bound to your Tailscale IP by default; expose externally with `/tunnel on` (cloudflared Quick Tunnel).
+- **Permission cards** — destructive tool uses surface as inline `[Approve] [Approve + remember] [Deny]` buttons. The remember option scopes auto-allow to that tool name for the rest of the session. Claude's clarifying questions (`AskUserQuestion`) render as tappable answer buttons instead of approve/deny.
+- **Web dashboard** — every session, transcript, and pending approval in the browser, plus activity stats. You can approve/deny permission cards and edit quiet hours or the auto-allow list from the settings page. Bound to your Tailscale IP by default; expose externally with `/tunnel on` (cloudflared Quick Tunnel).
 - **Media uploads from your phone** — photos, documents, voice notes. Voice gets transcribed locally with `mlx-whisper` (Apple Silicon only). Files land under `<cwd>/_uploads/` on the runner.
-- **Resilience** — bridge restarts preserve sessions via SDK `resume=`. Runner reconnects auto-reattach. `/resume` re-attaches sessions whose runner was offline at boot. `/undo` reverses the last destructive action (close, profile delete) within 30 minutes. `/move mac=laptop` migrates a session between hosts with the transcript intact.
+- **Resilience** — bridge restarts preserve sessions via SDK `resume=`. Runner reconnects auto-reattach. Sessions idle for 30+ minutes are paused to free memory; `/resume` re-attaches them — and any session whose runner was offline at boot — with the transcript intact. `/undo` reverses the last destructive action (close, profile delete) within 30 minutes. `/rewind` restores files Claude changed since your last message. `/move mac=laptop` migrates a session between hosts.
+- **Runaway backstops** — each session gets a turn cap (default 40) and a spend cap (default $5); the SDK ends the session cleanly when either is hit. If the primary model is rate-limited, a fallback model takes over. All tunable in `.env`.
 - **Profiles** — `/save myproj dir=~/code/myproj effort=high` saves a config you can launch with `/new myproj`. Per-profile system prompts let you bake project-specific guidance.
-- **Operational basics** — `/stats`, `/logs`, `/export`, `/search`, `/get` (download a file from a runner), `/macs` (green/yellow/red health per runner), `/quiet 22:00-07:00` (silent notifications window).
+- **Operational basics** — `/stats`, `/logs`, `/export`, `/search`, `/context` (context-window usage), `/get` (download a file from a runner), `/macs` (green/yellow/red health per runner), `/quiet 22:00-07:00` (silent notifications window).
 
 ## What you'll need
 
@@ -85,7 +86,7 @@ If something fails, see the rest of this README — the steps below cover the bi
    ```
 3. Find the most recent `message` object. Two values to copy:
    - `chat.id` — a **negative integer** like `-1001234567890`. → `TELEGRAM_CHAT_ID` in `.env`.
-   - `from.id` — a **positive integer** like `123456789`. That's your numeric Telegram user ID. → `TELEGRAM_ALLOWED_USER_IDS` in `.env` (comma-separated if you want to allow more users).
+   - `from.id` — a **positive integer** like `123456789`. That's your numeric Telegram user ID. → `TELEGRAM_ALLOWED_USER_IDS` in `.env`. The bot is single-user by design: with more than one ID the bridge refuses to boot unless you set `CT_ALLOW_MULTIPLE_USERS=1`, and every allowed user then sees every session and transcript.
 
 Alternative for the user ID: DM **`@userinfobot`** — it replies with your numeric ID.
 
@@ -193,12 +194,17 @@ All settings come from `.env`. See [`.env.example`](.env.example) for inline com
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | ✓ | — | Bot token from BotFather. |
 | `TELEGRAM_CHAT_ID` | ✓ | — | Negative integer; the supergroup ID. |
-| `TELEGRAM_ALLOWED_USER_IDS` | ✓ | — | Comma-separated user IDs allowed to interact. |
+| `TELEGRAM_ALLOWED_USER_IDS` | ✓ | — | Comma-separated user IDs allowed to interact. More than one ID requires `CT_ALLOW_MULTIPLE_USERS=1` (see step 3). |
 | `BRIDGE_HMAC_SECRET` | ✓ | — | Random 32+ char secret. Same value on every host's `.env`. |
 | `ANTHROPIC_API_KEY` | optional | — | Sets up API-key auth. Leave blank to use Pro/Max OAuth. |
 | `CT_DB_PATH` | — | `./state/ct.db` | SQLite store. Auto-created. |
 | `CT_RUNNER_HOST` | — | `127.0.0.1` | Where the runner listens on this host. Set to the tailnet IP on a runner-only host. |
 | `CT_RUNNER_PORT` | — | `8765` | Runner WebSocket port. |
+| `CT_IDLE_REAP_MINUTES` | — | `30` | Pause sessions idle this long to free memory; `/resume` re-attaches. `0` disables. |
+| `CT_RUNNER_FS_ROOTS` | — | (`$HOME` only) | Colon-separated roots the runner's file ops may touch. |
+| `CT_MAX_TURNS_PER_SESSION` | — | `40` | Per-session turn cap; `0` disables. |
+| `CT_MAX_BUDGET_USD` | — | `5.0` | Per-session spend cap; `0` disables. |
+| `CT_FALLBACK_MODEL` | — | `claude-sonnet-4-6` | Model used when the primary is rate-limited; empty disables auto-fallback. |
 | `CT_DASHBOARD_HOST` | — | (auto: tailnet IP) | Where the web dashboard binds. Auto-detects via `tailscale ip -4`; falls back to `127.0.0.1` if Tailscale CLI is missing. Set explicitly to override. |
 | `CT_DASHBOARD_PORT` | — | `8766` | Dashboard port. |
 | `CT_LOG_LEVEL` | — | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR`. |
@@ -246,11 +252,11 @@ The tool is auto-discovered; ask Claude to "convert this SVG to PNG" in any sess
 ## Architecture
 
 - **Bridge** — Telegram bot, command router, topic↔session map, web dashboard. One per fleet, runs on the always-on host. Long-polls Telegram so you don't need to expose a webhook.
-- **Runner** — daemon that owns Claude Agent SDK lifecycles. One per host. Bound to the tailnet IP, authenticated by HMAC.
+- **Runner** — daemon that owns Claude Agent SDK lifecycles. One per host. Listens on loopback by default (set `CT_RUNNER_HOST` to the tailnet IP on secondary hosts), authenticates every envelope by HMAC, and confines file operations to `$HOME` (`CT_RUNNER_FS_ROOTS` widens that).
 - **Store** — SQLite on the always-on host. Sessions, profiles, mac registry, pending approvals, message log. Schema migrations run forward-only on boot.
 - **Transport** — WebSocket + JSON envelopes over Tailscale. HMAC covers in-flight auth; Tailscale provides the trust boundary.
 
-Both the bridge and the local runner can live in the same process for development (`uv run python -m ct.bridge.main`) or as separate supervised services in production (what `deploy/install.sh` sets up).
+For development, run each in its own terminal: the runner first (`uv run python -m ct.runner.main`), then the bridge (`uv run python -m ct.bridge.main`) — the bridge exits at boot if its primary runner is unreachable. In production both run as the supervised services `deploy/install.sh` sets up. The dashboard isn't a third process; it runs inside the bridge.
 
 ## Repository layout
 
@@ -264,6 +270,7 @@ src/ct/
   protocol/       # envelope dataclasses shared between bridge and runner
 deploy/
   install.sh                  # OS-detecting installer (launchd or systemd)
+  upgrade.sh                  # git pull --ff-only + uv sync + service reload
   bridge.plist.template       # macOS LaunchAgent
   runner.plist.template
   bridge.service.template     # Linux systemd --user unit
@@ -291,6 +298,7 @@ tests/            # pytest, asyncio
 
 **Sessions show "orphaned" after a reboot.**
 - The runner was unreachable when the bridge restored sessions on boot. Once the runner is back online, run `/resume` in General — buttons appear for each orphaned session.
+- Sessions also pause (orphan) after 30 minutes idle — the topic gets a "Session paused" notice. `/resume` inside the topic re-attaches just that one.
 
 **Voice messages aren't being transcribed.**
 - Voice transcription is Apple-Silicon-only via `mlx-whisper`. On Linux/Intel hosts, the runner returns the audio file at `<cwd>/_uploads/<timestamp>-voice.ogg` without transcription; you'd need to ask Claude to read/process it directly.
